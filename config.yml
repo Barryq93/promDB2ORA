@@ -1,0 +1,98 @@
+global_config:
+  log_level: INFO
+  retry_conn_interval: 60
+  default_time_interval: 15
+  log_path: "logs\\"
+  port: 8080
+  use_https: true
+  cert_file: "certs\\server.crt"
+  key_file: "certs\\server.key"
+  prometheus_mtls_enabled: true
+  prometheus_client_ca_cert_file: "certs\\prometheus-ca-cert.crt"
+  shutdown_timeout: 30
+  worker_pool_size: 10
+  encryption_key: "32-byte-long-secret-key-here!!"
+  rate_limit_requests: 100
+  rate_limit_burst: 50
+  circuit_breaker_config:
+    timeout: 1000
+    max_concurrent: 50
+    error_percent: 50
+    sleep_window: 5000
+
+queries:
+  - name: "Lockwaits"
+    db_type: "DB2"
+    runs_on: ["production"]
+    time_interval: 10
+    query: |
+      select
+        count(*) count,
+        coalesce(max(LOCK_WAIT_ELAPSED_TIME), 0) max_time
+      from
+        SYSIBMADM.MON_LOCKWAITS
+    gauges:
+      - name: "db2_lockwaits_count"
+        desc: "Amount of lockwaits"
+        col: 1
+      - name: "db2_lockwaits_maxwait_seconds"
+        desc: "Maximum number of seconds apps are waiting to get lock"
+        col: 2
+        extra_labels:
+          time: "seconds"
+    timeout: 30
+    priority: 2
+
+  - name: "Active Connections"
+    db_type: "Oracle"
+    runs_on: ["production"]
+    time_interval: 15
+    query: |
+      SELECT COUNT(*) AS active_connections
+      FROM v$session
+      WHERE status = 'ACTIVE'
+    gauges:
+      - name: "oracle_active_connections"
+        desc: "Number of active Oracle connections"
+        col: 1
+    timeout: 20
+    priority: 1
+
+connections:
+  - db_host: "192.168.50.253"
+    db_name: "sample"
+    db_port: 50000
+    db_user: "DB2INST1"
+    db_passwd: "mypassword" # Replace with encrypted value in production
+    db_type: "DB2"
+    tls_enabled: true
+    tls_cert_file: "certs\\db2-cert.crt"
+    tls_key_file: "certs\\db2-key.key"
+    tls_ca_cert_file: "certs\\db2-ca-cert.crt"
+    tags: [production, proddb1]
+    extra_labels:
+      dbinstance: db2inst1
+      dbenv: production
+    max_conns: 50
+    idle_timeout: 300
+
+  - db_host: "192.168.50.254"
+    db_name: "oracle_db"
+    db_port: 1521
+    db_user: "oracle_user"
+    db_passwd: "oracle_password" # Replace with encrypted value in production
+    db_type: "Oracle"
+    tls_enabled: true
+    tls_cert_file: "certs\\oracle-cert.crt"
+    tls_key_file: "certs\\oracle-key.key"
+    tls_ca_cert_file: "certs\\oracle-ca-cert.crt"
+    tags: [production, prodoracle]
+    extra_labels:
+      dbinstance: orcldb
+      dbenv: production
+    max_conns: 50
+    idle_timeout: 300
+
+basic_auth:
+  username: "admin"
+  password: "securepassword" # Replace with encrypted value in production
