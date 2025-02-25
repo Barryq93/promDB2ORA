@@ -5,10 +5,11 @@ import (
     "crypto/cipher"
     "crypto/rand"
     "encoding/base64"
+    "fmt"
     "io"
     "net/http"
 
-    "github.com/example/db-monitoring-app/internal/app"
+    "github.com/barryq93/promDB2ORA/internal/app"
     "github.com/prometheus/client_golang/prometheus"
     "github.com/sirupsen/logrus"
 )
@@ -25,6 +26,7 @@ func SetLogLevel(level string) {
         logrus.SetLevel(logrus.ErrorLevel)
     default:
         logrus.SetLevel(logrus.InfoLevel)
+        logrus.Warnf("Unknown log level %s, defaulting to INFO", level)
     }
 }
 
@@ -65,15 +67,15 @@ func ShouldRunQuery(query app.Query, conn app.Connection) bool {
 func Encrypt(key, text string) (string, error) {
     block, err := aes.NewCipher([]byte(key))
     if err != nil {
-        return "", err
+        return "", fmt.Errorf("creating cipher: %v", err)
     }
     gcm, err := cipher.NewGCM(block)
     if err != nil {
-        return "", err
+        return "", fmt.Errorf("creating GCM: %v", err)
     }
     nonce := make([]byte, gcm.NonceSize())
     if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-        return "", err
+        return "", fmt.Errorf("generating nonce: %v", err)
     }
     ciphertext := gcm.Seal(nil, nonce, []byte(text), nil)
     return base64.StdEncoding.EncodeToString(append(nonce, ciphertext...)), nil
@@ -82,24 +84,24 @@ func Encrypt(key, text string) (string, error) {
 func Decrypt(key []byte, encrypted string) (string, error) {
     data, err := base64.StdEncoding.DecodeString(encrypted)
     if err != nil {
-        return "", err
+        return "", fmt.Errorf("decoding base64: %v", err)
     }
     block, err := aes.NewCipher(key)
     if err != nil {
-        return "", err
+        return "", fmt.Errorf("creating cipher: %v", err)
     }
     gcm, err := cipher.NewGCM(block)
     if err != nil {
-        return "", err
+        return "", fmt.Errorf("creating GCM: %v", err)
     }
     nonceSize := gcm.NonceSize()
     if len(data) < nonceSize {
-        return "", fmt.Errorf("invalid ciphertext")
+        return "", fmt.Errorf("invalid ciphertext: too short")
     }
     nonce, ciphertext := data[:nonceSize], data[nonceSize:]
     plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
     if err != nil {
-        return "", err
+        return "", fmt.Errorf("decrypting: %v", err)
     }
     return string(plaintext), nil
 }

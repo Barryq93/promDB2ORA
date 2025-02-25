@@ -11,8 +11,8 @@ import (
     "sync"
     "time"
 
-    "github.com/example/db-monitoring-app/internal/db"
-    "github.com/example/db-monitoring-app/internal/utils"
+    "github.com/barryq93/promDB2ORA/internal/db"
+    "github.com/barryq93/promDB2ORA/internal/utils"
     "github.com/fsnotify/fsnotify"
     "github.com/gojek/heimdall/v7/hystrix"
     "github.com/juju/ratelimit"
@@ -110,8 +110,10 @@ type QueryJob struct {
 func NewApplication(configFile string) (*Application, error) {
     config, err := loadConfig(configFile)
     if err != nil {
-        return nil, err
+        return nil, fmt.Errorf("loading config: %v", err)
     }
+
+    utils.SetLogLevel(config.GlobalConfig.LogLevel)
 
     app := &Application{
         config:         config,
@@ -125,8 +127,7 @@ func NewApplication(configFile string) (*Application, error) {
     for _, conn := range config.Connections {
         client, err := db.NewDBClient(conn)
         if err != nil {
-            logrus.Errorf("Failed to initialize DB client for %s: %v", conn.DBName, err)
-            continue
+            return nil, fmt.Errorf("initializing DB client for %s: %v", conn.DBName, err)
         }
         app.dbClients[conn.DBName] = client
     }
@@ -141,6 +142,8 @@ func NewApplication(configFile string) (*Application, error) {
         )
     }
 
+    app.loadCircuitBreakerState() // Load persisted state
+
     for i := 0; i < config.GlobalConfig.WorkerPoolSize; i++ {
         app.wg.Add(1)
         go app.worker()
@@ -148,6 +151,7 @@ func NewApplication(configFile string) (*Application, error) {
 
     app.scheduleQueries()
     app.server = app.startHTTPServer()
+    app.dlq.ProcessRetries(app) // Start DLQ retry mechanism
 
     go app.watchConfig(configFile)
     go app.watchCertificates()
@@ -200,29 +204,29 @@ func (app *Application) executeQuery(job QueryJob) {
             break
         }
 
-        retryAttempts.WithLabelValues(job.Query.Name, job.Query.DBType).Inc()
+        retryAttempts.WithLabelValues(job.Query.Name, job.Query.DBType, job.Connection.ExtraLabels["dbinstance"]).Inc()
         logger.WithField("attempt", attempt).Warnf("Query failed: %v", err)
-        time.Sleep(time.Duration(app.config.GlobalConfig.RetryConnInterval) * time.Second * attempt)
+        time.Sleep(time.Duration(app.config.GlobalConfig.RetryConnInterval) * time.Second * time.Duration(attempt))
     }
 
     if err != nil {
         app.dlq.Add(job)
-        errorCounter.WithLabelValues(job.Query.Name, job.Query.DBType).Inc()
+        errorCounter.WithLabelValues(job.Query.Name, job.Query.DBType, job.Connection.ExtraLabels["dbinstance"]).Inc()
         logger.Error("Query failed after max retries, sent to dead letter queue")
         return
     }
 
     duration := time.Since(start).Seconds()
-    queryLatencyHist.WithLabelValues(job.Query.Name, job.Query.DBType).Observe(duration)
+    queryLatencyHist.WithLabelValues(job.Query.Name, job.Query.DBType, job.Connection.ExtraLabels["dbinstance"]).Observe(duration)
 
     for _, gauge := range job.Query.Gauges {
         value := results[gauge.Col-1]
         labels := utils.MergeLabels(job.Connection.ExtraLabels, gauge.ExtraLabels)
-        prometheus.NewGauge(prometheus.GaugeOpts{
+        prometheus.MustRegister(prometheus.NewGauge(prometheus.GaugeOpts{
             Name:        gauge.Name,
             Help:        gauge.Desc,
             ConstLabels: labels,
-        }).Set(value)
+        })).Set(value)
     }
 }
 
@@ -230,40 +234,39 @@ func (app *Application) scheduleQueries() {
     type prioritizedJob struct {
         job      QueryJob
         priority int
+        nextRun  time.Time
     }
 
-    jobs := make(chan prioritizedJob, len(app.config.Queries)*len(app.config.Connections))
-
+    jobs := make([]prioritizedJob, 0, len(app.config.Queries)*len(app.config.Connections))
     for _, query := range app.config.Queries {
         for _, conn := range app.config.Connections {
             if utils.ShouldRunQuery(query, conn) {
-                go func(q Query, c Connection) {
-                    ticker := time.NewTicker(time.Duration(q.TimeInterval) * time.Second)
-                    defer ticker.Stop()
-                    for {
-                        select {
-                        case <-ticker.C:
-                            jobs <- prioritizedJob{
-                                job: QueryJob{
-                                    Query:      q,
-                                    Connection: c,
-                                    Context:    context.Background(),
-                                },
-                                priority: q.Priority,
-                            }
-                        case <-app.shutdown:
-                            return
-                        }
-                    }
-                }(query, conn)
+                jobs = append(jobs, prioritizedJob{
+                    job:      QueryJob{Query: query, Connection: conn, Context: context.Background()},
+                    priority: query.Priority,
+                    nextRun:  time.Now(),
+                })
             }
         }
     }
 
     go func() {
-        for job := range jobs {
-            app.workerPool <- job.job
-            workerQueueGauge.Set(float64(len(app.workerPool)))
+        ticker := time.NewTicker(time.Second)
+        defer ticker.Stop()
+        for {
+            select {
+            case <-ticker.C:
+                now := time.Now()
+                for i := range jobs {
+                    if now.After(jobs[i].nextRun) {
+                        app.workerPool <- jobs[i].job
+                        workerQueueGauge.Set(float64(len(app.workerPool)))
+                        jobs[i].nextRun = now.Add(time.Duration(jobs[i].job.Query.TimeInterval) * time.Second)
+                    }
+                }
+            case <-app.shutdown:
+                return
+            }
         }
     }()
 }
@@ -293,7 +296,13 @@ func (app *Application) startHTTPServer() *http.Server {
     }
 
     if app.config.GlobalConfig.UseHTTPS {
-        tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
+        tlsConfig := &tls.Config{
+            MinVersion: tls.VersionTLS13, // Enforce modern TLS
+            CipherSuites: []uint16{       // Prefer strong ciphers
+                tls.TLS_AES_128_GCM_SHA256,
+                tls.TLS_AES_256_GCM_SHA384,
+            },
+        }
 
         cert, err := tls.LoadX509KeyPair(app.config.GlobalConfig.CertFile, app.config.GlobalConfig.KeyFile)
         if err != nil {
@@ -314,7 +323,7 @@ func (app *Application) startHTTPServer() *http.Server {
 
         server.TLSConfig = tlsConfig
         go func() {
-            if err := server.ListenAndServeTLS(app.config.GlobalConfig.CertFile, app.config.GlobalConfig.KeyFile); err != nil && err != http.ErrServerClosed {
+            if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
                 logrus.Fatalf("HTTPS server failed: %v", err)
             }
         }()
@@ -330,22 +339,34 @@ func (app *Application) startHTTPServer() *http.Server {
 
 func (app *Application) healthHandler(w http.ResponseWriter, r *http.Request) {
     status := struct {
-        Databases map[string]string `json:"databases"`
-    }{Databases: make(map[string]string)}
+        Databases       map[string]string `json:"databases"`
+        WorkerPool      int               `json:"worker_pool"`
+        CircuitBreakers map[string]int    `json:"circuit_breakers"`
+    }{
+        Databases:       make(map[string]string),
+        CircuitBreakers: make(map[string]int),
+    }
 
     for name, client := range app.dbClients {
+        status.Databases[name] = "healthy"
         if err := client.Ping(); err != nil {
-            status.Databases[name] = "unhealthy"
-        } else {
-            status.Databases[name] = "healthy"
+            status.Databases[name] = fmt.Sprintf("unhealthy: %v", err)
         }
     }
-    json.NewEncoder(w).Encode(status)
+    status.WorkerPool = len(app.workerPool)
+    for db, cb := range app.circuitBreakers {
+        status.CircuitBreakers[db] = int(cb.HealthCheck())
+    }
+    w.Header().Set("Content-Type", "application/json")
+    if err := json.NewEncoder(w).Encode(status); err != nil {
+        logrus.Errorf("Failed to encode health response: %v", err)
+    }
 }
 
 func (app *Application) Shutdown() {
     close(app.shutdown)
     app.wg.Wait()
+    app.saveCircuitBreakerState()
     ctx, cancel := context.WithTimeout(context.Background(), time.Duration(app.config.GlobalConfig.ShutdownTimeout)*time.Second)
     defer cancel()
     if err := app.server.Shutdown(ctx); err != nil {
@@ -356,12 +377,12 @@ func (app *Application) Shutdown() {
 func (app *Application) watchConfig(filename string) {
     watcher, err := fsnotify.NewWatcher()
     if err != nil {
-        logrus.Fatal(err)
+        logrus.Fatalf("Failed to create config watcher: %v", err)
     }
     defer watcher.Close()
 
     if err := watcher.Add(filename); err != nil {
-        logrus.Fatal(err)
+        logrus.Fatalf("Failed to watch config file: %v", err)
     }
 
     for {
@@ -378,7 +399,7 @@ func (app *Application) watchConfig(filename string) {
                 }
                 app.mu.Lock()
                 app.config = config
-                app.reloadDBClients() // Reload DB clients on config change
+                app.reloadDBClients()
                 app.mu.Unlock()
                 logrus.Info("Configuration reloaded successfully")
             }
@@ -387,6 +408,8 @@ func (app *Application) watchConfig(filename string) {
                 return
             }
             logrus.Errorf("Config watcher error: %v", err)
+        case <-app.shutdown:
+            return
         }
     }
 }
@@ -394,7 +417,7 @@ func (app *Application) watchConfig(filename string) {
 func (app *Application) watchCertificates() {
     watcher, err := fsnotify.NewWatcher()
     if err != nil {
-        logrus.Fatal(err)
+        logrus.Fatalf("Failed to create certificate watcher: %v", err)
     }
     defer watcher.Close()
 
@@ -431,6 +454,8 @@ func (app *Application) watchCertificates() {
                 return
             }
             logrus.Errorf("Certificate watcher error: %v", err)
+        case <-app.shutdown:
+            return
         }
     }
 }
@@ -452,28 +477,91 @@ func (app *Application) reloadDBClients() {
     }
 }
 
+func (app *Application) saveCircuitBreakerState() {
+    app.mu.Lock()
+    defer app.mu.Unlock()
+    state := make(map[string]int)
+    for db, cb := range app.circuitBreakers {
+        state[db] = int(cb.HealthCheck())
+    }
+    data, err := json.Marshal(state)
+    if err != nil {
+        logrus.Errorf("Failed to marshal circuit breaker state: %v", err)
+        return
+    }
+    if err := ioutil.WriteFile("cb_state.json", data, 0644); err != nil {
+        logrus.Errorf("Failed to save circuit breaker state: %v", err)
+    }
+}
+
+func (app *Application) loadCircuitBreakerState() {
+    data, err := ioutil.ReadFile("cb_state.json")
+    if err != nil {
+        logrus.Infof("No circuit breaker state file found: %v", err)
+        return
+    }
+    state := make(map[string]int)
+    if err := json.Unmarshal(data, &state); err != nil {
+        logrus.Errorf("Failed to unmarshal circuit breaker state: %v", err)
+        return
+    }
+    for db, cb := range app.circuitBreakers {
+        if s, ok := state[db]; ok {
+            // Simplified: Assume state persists as a hint; real state depends on runtime checks
+            logrus.Infof("Restored circuit breaker state for %s: %d", db, s)
+        }
+    }
+}
+
 func loadConfig(filename string) (Config, error) {
     var config Config
     data, err := ioutil.ReadFile(filename)
     if err != nil {
-        return config, err
+        return config, fmt.Errorf("reading file: %v", err)
     }
     if err := yaml.Unmarshal(data, &config); err != nil {
-        return config, err
+        return config, fmt.Errorf("unmarshaling YAML: %v", err)
     }
 
+    // Validation
+    if config.GlobalConfig.RetryConnInterval < 0 {
+        return config, fmt.Errorf("retry_conn_interval cannot be negative")
+    }
+    for _, q := range config.Queries {
+        if q.TimeInterval <= 0 {
+            return config, fmt.Errorf("query %s: time_interval must be positive", q.Name)
+        }
+        if q.Timeout <= 0 {
+            return config, fmt.Errorf("query %s: timeout must be positive", q.Name)
+        }
+    }
+
+    isDev := os.Getenv("ENV") == "development"
     if config.GlobalConfig.EncryptionKey != "" {
         key := []byte(config.GlobalConfig.EncryptionKey)
         for i := range config.Connections {
+            if !isEncrypted(config.Connections[i].DBPasswd) && !isDev {
+                return config, fmt.Errorf("db_passwd for %s must be encrypted in production", config.Connections[i].DBName)
+            }
             if decrypted, err := utils.Decrypt(key, config.Connections[i].DBPasswd); err == nil {
                 config.Connections[i].DBPasswd = decrypted
+            } else if !isDev {
+                return config, fmt.Errorf("failed to decrypt db_passwd for %s: %v", config.Connections[i].DBName, err)
             }
+        }
+        if !isEncrypted(config.BasicAuth.Password) && !isDev {
+            return config, fmt.Errorf("basic_auth.password must be encrypted in production")
         }
         if decrypted, err := utils.Decrypt(key, config.BasicAuth.Password); err == nil {
             config.BasicAuth.Password = decrypted
+        } else if !isDev {
+            return config, fmt.Errorf("failed to decrypt basic_auth.password: %v", err)
         }
+    } else if !isDev {
+        return config, fmt.Errorf("encryption_key must be set in production")
     }
 
+    // Set defaults
     if config.GlobalConfig.WorkerPoolSize == 0 {
         config.GlobalConfig.WorkerPoolSize = 10
     }
@@ -487,4 +575,9 @@ func loadConfig(filename string) (Config, error) {
         config.GlobalConfig.RateLimitBurst = 50
     }
     return config, nil
+}
+
+func isEncrypted(s string) bool {
+    _, err := base64.StdEncoding.DecodeString(s)
+    return err == nil && len(s) > 32
 }

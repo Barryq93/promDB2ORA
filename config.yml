@@ -11,7 +11,7 @@ global_config:
   prometheus_client_ca_cert_file: "certs\\prometheus-ca-cert.crt"
   shutdown_timeout: 30
   worker_pool_size: 10
-  encryption_key: "32-byte-long-secret-key-here!!"
+  encryption_key: "32-byte-long-secret-key-here!!" # Must be 32 bytes for AES-256
   rate_limit_requests: 100
   rate_limit_burst: 50
   circuit_breaker_config:
@@ -63,7 +63,7 @@ connections:
     db_name: "sample"
     db_port: 50000
     db_user: "DB2INST1"
-    db_passwd: "mypassword" # Replace with encrypted value in production
+    db_passwd: "ENCRYPTED_VALUE_HERE" # Replace with output from encrypt_password.go
     db_type: "DB2"
     tls_enabled: true
     tls_cert_file: "certs\\db2-cert.crt"
@@ -80,7 +80,7 @@ connections:
     db_name: "oracle_db"
     db_port: 1521
     db_user: "oracle_user"
-    db_passwd: "oracle_password" # Replace with encrypted value in production
+    db_passwd: "ENCRYPTED_VALUE_HERE" # Replace with output from encrypt_password.go
     db_type: "Oracle"
     tls_enabled: true
     tls_cert_file: "certs\\oracle-cert.crt"
@@ -95,4 +95,4 @@ connections:
 
 basic_auth:
   username: "admin"
-  password: "securepassword" # Replace with encrypted value in production
+  password: "ENCRYPTED_VALUE_HERE" # Replace with output from encrypt_password.go

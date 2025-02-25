@@ -7,7 +7,7 @@ import (
     "os/signal"
     "syscall"
 
-    "github.com/example/db-monitoring-app/internal/app"
+    "github.com/barryq93/promDB2ORA/internal/app"
     "github.com/prometheus/client_golang/prometheus"
     "github.com/sirupsen/logrus"
 )
@@ -20,14 +20,14 @@ var (
             Help:    "Duration of query execution in seconds",
             Buckets: prometheus.ExponentialBuckets(0.1, 2, 10),
         },
-        []string{"query_name", "db_type"},
+        []string{"query_name", "db_type", "db_instance"},
     )
     errorCounter = prometheus.NewCounterVec(
         prometheus.CounterOpts{
             Name: "query_errors_total",
             Help: "Total number of query errors",
         },
-        []string{"query_name", "db_type"},
+        []string{"query_name", "db_type", "db_instance"},
     )
     workerQueueGauge = prometheus.NewGauge(
         prometheus.GaugeOpts{
@@ -47,14 +47,12 @@ var (
             Name: "query_retry_attempts_total",
             Help: "Total number of retry attempts",
         },
-        []string{"query_name", "db_type"},
+        []string{"query_name", "db_type", "db_instance"},
     )
 )
 
-func main() {
-    configFile := flag.String("config", "config.yml", "Path to configuration file")
-    flag.Parse()
-
+func init() {
+    // Set up logging with environment-specific configuration
     logger.SetFormatter(&logrus.JSONFormatter{
         FieldMap: logrus.FieldMap{
             logrus.FieldKeyMsg:  "message",
@@ -62,17 +60,27 @@ func main() {
         },
     })
     logger.SetOutput(os.Stdout)
+    if level := os.Getenv("LOG_LEVEL"); level != "" {
+        app.SetLogLevel(level) // Use utils function
+    }
 
+    // Register Prometheus metrics
     prometheus.MustRegister(queryLatencyHist, errorCounter, workerQueueGauge, circuitBreakerState, retryAttempts)
+}
+
+func main() {
+    configFile := flag.String("config", "config.yml", "Path to configuration file")
+    flag.Parse()
 
     application, err := app.NewApplication(*configFile)
     if err != nil {
-        log.Fatalf("Failed to initialize application: %v", err)
+        log.Fatalf("Failed to initialize application: %v", err) // Fatal exits cleanly
     }
 
     sigChan := make(chan os.Signal, 1)
     signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
+    logger.Info("Application started successfully")
     <-sigChan
     logger.Info("Shutdown signal received")
     application.Shutdown()
