@@ -8,6 +8,7 @@ import (
     "fmt"
     "io/ioutil"
     "net/http"
+    "os"
     "sync"
     "time"
 
@@ -24,6 +25,7 @@ import (
 
 type Config struct {
     GlobalConfig struct {
+        Env                    string `yaml:"env"` // Added to read environment from config
         LogLevel               string `yaml:"log_level"`
         RetryConnInterval      int    `yaml:"retry_conn_interval"`
         DefaultTimeInterval    int    `yaml:"default_time_interval"`
@@ -161,6 +163,11 @@ func NewApplication(configFile string) (*Application, error) {
 
 func (app *Application) worker() {
     defer app.wg.Done()
+    defer func() {
+        if r := recover(); r != nil {
+            logrus.Errorf("Worker recovered from panic: %v", r)
+        }
+    }()
     for {
         select {
         case job := <-app.workerPool:
@@ -507,7 +514,13 @@ func (app *Application) loadCircuitBreakerState() {
     }
     for db, cb := range app.circuitBreakers {
         if s, ok := state[db]; ok {
-            // Simplified: Assume state persists as a hint; real state depends on runtime checks
+            switch s {
+            case 1: // Open
+                cb.Execute(func() (interface{}, error) { return nil, fmt.Errorf("force open") }, nil)
+            case 2: // Half-open
+                // Heimdall doesn’t directly support setting half-open; simulate with a single failure
+                cb.Execute(func() (interface{}, error) { return nil, fmt.Errorf("half-open hint") }, nil)
+            }
             logrus.Infof("Restored circuit breaker state for %s: %d", db, s)
         }
     }
@@ -536,7 +549,17 @@ func loadConfig(filename string) (Config, error) {
         }
     }
 
-    isDev := os.Getenv("ENV") == "development"
+    // Determine environment: prefer config value, fall back to os.Getenv
+    env := config.GlobalConfig.Env
+    if env == "" {
+        env = os.Getenv("ENV")
+    }
+    if env == "" {
+        env = "production" // Default to production if not specified
+        logrus.Warn("Environment not specified in config or ENV; defaulting to production")
+    }
+    isDev := env == "development"
+
     if config.GlobalConfig.EncryptionKey != "" {
         key := []byte(config.GlobalConfig.EncryptionKey)
         for i := range config.Connections {

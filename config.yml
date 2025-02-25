@@ -1,4 +1,5 @@
 global_config:
+  env: "production" # Added to specify environment; options: "development" or "production"
   log_level: INFO
   retry_conn_interval: 60
   default_time_interval: 15

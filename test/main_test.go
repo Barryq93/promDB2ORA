@@ -339,3 +339,51 @@ func TestBasicAuthHandler(t *testing.T) {
     handler.ServeHTTP(rr, req)
     assert.Equal(t, http.StatusUnauthorized, rr.Code)
 }
+
+func TestExecuteQueryCircuitBreakerOpen(t *testing.T) {
+    mockClient := new(MockDBClient)
+    appInstance := &app.Application{
+        config: app.Config{
+            GlobalConfig: struct {
+                LogLevel               string `yaml:"log_level"`
+                RetryConnInterval      int    `yaml:"retry_conn_interval"`
+                DefaultTimeInterval    int    `yaml:"default_time_interval"`
+                LogPath                string `yaml:"log_path"`
+                Port                   int    `yaml:"port"`
+                UseHTTPS               bool   `yaml:"use_https"`
+                CertFile               string `yaml:"cert_file"`
+                KeyFile                string `yaml:"key_file"`
+                PrometheusMTLSEnabled  bool   `yaml:"prometheus_mtls_enabled"`
+                PrometheusClientCACert string `yaml:"prometheus_client_ca_cert_file"`
+                ShutdownTimeout        int    `yaml:"shutdown_timeout"`
+                WorkerPoolSize         int    `yaml:"worker_pool_size"`
+                EncryptionKey          string `yaml:"encryption_key"`
+                RateLimitRequests      int    `yaml:"rate_limit_requests"`
+                RateLimitBurst         int    `yaml:"rate_limit_burst"`
+                CircuitBreakerConfig   struct {
+                    Timeout       int `yaml:"timeout"`
+                    MaxConcurrent int `yaml:"max_concurrent"`
+                    ErrorPercent  int `yaml:"error_percent"`
+                    SleepWindow   int `yaml:"sleep_window"`
+                } `yaml:"circuit_breaker_config"`
+            }{LogPath: t.TempDir()},
+        },
+        dbClients:      map[string]*db.DBClient{"testdb": mockClient},
+        circuitBreakers: map[string]*hystrix.Client{"testdb": hystrix.NewClient(hystrix.WithErrorPercentThreshold(1))},
+        dlq:            app.NewDeadLetterQueue(t.TempDir()),
+        workerPool:     make(chan app.QueryJob, 1),
+        shutdown:       make(chan struct{}),
+    }
+
+    // Force circuit breaker to open
+    appInstance.circuitBreakers["testdb"].Execute(func() (interface{}, error) { return nil, fmt.Errorf("fail") }, nil)
+
+    job := app.QueryJob{
+        Query:      app.Query{Name: "TestQuery", DBType: "DB2", Query: "SELECT 1", Timeout: 1},
+        Connection: app.Connection{DBName: "testdb", DBType: "DB2"},
+        Context:    context.Background(),
+    }
+    appInstance.ExecuteQuery(job)
+    files, _ := ioutil.ReadDir(appInstance.dlq.Path())
+    assert.Len(t, files, 1)
+}
