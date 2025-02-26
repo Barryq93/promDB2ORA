@@ -25,7 +25,7 @@ var (
 	logger = logrus.New()
 
 	circuitBreakerState = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
+		prometheus.GaugeughtyOpts{
 			Name: "circuit_breaker_state",
 			Help: "Current state of circuit breakers (0=closed, 1=open)",
 		},
@@ -194,14 +194,26 @@ func (app *Application) executeQuery(job QueryJob) {
 	cb := app.circuitBreakers[job.Connection.DBName]
 	start := time.Now()
 
-	results, err := app.dbClients[job.Connection.DBName].ExecuteQuery(job.Context, job.Query.Query)
+	// Wrap query execution with circuit breaker
+	var results []float64
+	err := cb.Execute(func() (interface{}, error) {
+		var err error
+		results, err = app.dbClients[job.Connection.DBName].ExecuteQuery(job.Context, job.Query.Query)
+		return results, err
+	}, nil) // No fallback provided for simplicity
+
 	if err != nil {
 		retryAttempts.WithLabelValues(job.Query.Name, job.Query.DBType, job.Connection.DBName).Inc()
 		errorCounter.WithLabelValues(job.Query.Name, job.Query.DBType, job.Connection.DBName).Inc()
 		logger.Error("Query failed after retries, sending to dead letter queue")
 		app.dlq.Add(job)
+		// Update circuit breaker state metric
+		circuitBreakerState.WithLabelValues(job.Connection.DBName).Set(1) // Open state
 		return
 	}
+
+	// If successful, ensure circuit breaker state reflects closed
+	circuitBreakerState.WithLabelValues(job.Connection.DBName).Set(0) // Closed state
 
 	duration := time.Since(start).Seconds()
 	queryLatencyHist.WithLabelValues(job.Query.Name, job.Query.DBType, job.Connection.DBName).Observe(duration)
@@ -264,7 +276,7 @@ func (app *Application) startHTTPServer() *http.Server {
 	}
 
 	go func() {
-		if err := server.ListenAndServe(); err != nil {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logrus.Fatalf("HTTP server error: %v", err)
 		}
 	}()
