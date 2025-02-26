@@ -56,7 +56,7 @@ var (
 )
 
 // ========================
-// 🔹 Config Struct (Fix for Missing Definition)
+// 🔹 Config Struct
 // ========================
 type Config struct {
 	GlobalConfig struct {
@@ -99,6 +99,7 @@ type Application struct {
 	shutdown        chan struct{}
 	wg              sync.WaitGroup
 	server          *http.Server
+	dlq             *DeadLetterQueue
 }
 
 // QueryJob Struct
@@ -125,6 +126,7 @@ func NewApplication(configFile string) (*Application, error) {
 		workerPool:      make(chan QueryJob, config.GlobalConfig.WorkerPoolSize),
 		circuitBreakers: make(map[string]*hystrix.Client),
 		shutdown:        make(chan struct{}),
+		dlq:             NewDeadLetterQueue(config.GlobalConfig.LogPath),
 	}
 
 	for _, conn := range config.Connections {
@@ -135,7 +137,7 @@ func NewApplication(configFile string) (*Application, error) {
 		app.dbClients[conn.DBName] = client
 	}
 
-	// 🔹 Correct Circuit Breaker Initialization
+	// Initialize circuit breakers
 	for _, conn := range config.Connections {
 		cbConfig := config.GlobalConfig.CircuitBreakerConfig
 		app.circuitBreakers[conn.DBName] = hystrix.NewClient(
@@ -146,8 +148,20 @@ func NewApplication(configFile string) (*Application, error) {
 		)
 	}
 
+	// Start workers
+	for i := 0; i < config.GlobalConfig.WorkerPoolSize; i++ {
+		app.wg.Add(1)
+		go app.worker()
+	}
+
+	// Schedule queries
 	app.scheduleQueries()
+
+	// Start HTTP server
 	app.server = app.startHTTPServer()
+
+	// Start DLQ retry processor
+	app.dlq.ProcessRetries(app)
 
 	return app, nil
 }
@@ -180,23 +194,61 @@ func (app *Application) executeQuery(job QueryJob) {
 	cb := app.circuitBreakers[job.Connection.DBName]
 	start := time.Now()
 
-	req, err := http.NewRequest("POST", job.Query.Query, nil) // Modify as needed
-	if err != nil {
-		logger.Error("Failed to create request: ", err)
-		return
-	}
-
-	_, err = cb.Do(req)
+	results, err := app.dbClients[job.Connection.DBName].ExecuteQuery(job.Context, job.Query.Query)
 	if err != nil {
 		retryAttempts.WithLabelValues(job.Query.Name, job.Query.DBType, job.Connection.DBName).Inc()
 		errorCounter.WithLabelValues(job.Query.Name, job.Query.DBType, job.Connection.DBName).Inc()
 		logger.Error("Query failed after retries, sending to dead letter queue")
+		app.dlq.Add(job)
 		return
 	}
 
 	duration := time.Since(start).Seconds()
 	queryLatencyHist.WithLabelValues(job.Query.Name, job.Query.DBType, job.Connection.DBName).Observe(duration)
 	logger.Info("Query executed successfully")
+
+	// Process results and update Prometheus metrics
+	for _, gauge := range job.Query.Gauges {
+		if gauge.Col <= len(results) {
+			metric := prometheus.NewGauge(prometheus.GaugeOpts{
+				Name:        gauge.Name,
+				Help:        gauge.Desc,
+				ConstLabels: utils.MergeLabels(job.Connection.ExtraLabels, gauge.ExtraLabels),
+			})
+			metric.Set(results[gauge.Col-1])
+			prometheus.MustRegister(metric)
+		}
+	}
+}
+
+// ========================
+// 🔹 Schedule Queries
+// ========================
+func (app *Application) scheduleQueries() {
+	for _, query := range app.config.Queries {
+		for _, conn := range app.config.Connections {
+			if utils.ShouldRunQuery(query, conn) {
+				app.wg.Add(1)
+				go func(q types.Query, c types.Connection) {
+					defer app.wg.Done()
+					ticker := time.NewTicker(time.Duration(q.TimeInterval) * time.Second)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-ticker.C:
+							app.workerPool <- QueryJob{
+								Query:      q,
+								Connection: c,
+								Context:    context.Background(),
+							}
+						case <-app.shutdown:
+							return
+						}
+					}
+				}(query, conn)
+			}
+		}
+	}
 }
 
 // ========================
