@@ -25,7 +25,7 @@ import (
 
 type Config struct {
     GlobalConfig struct {
-        Env                    string `yaml:"env"` // Added to read environment from config
+        Env                    string `yaml:"env"`
         LogLevel               string `yaml:"log_level"`
         RetryConnInterval      int    `yaml:"retry_conn_interval"`
         DefaultTimeInterval    int    `yaml:"default_time_interval"`
@@ -101,12 +101,14 @@ type Application struct {
     wg             sync.WaitGroup
     mu             sync.Mutex
     server         *http.Server
+    gauges         map[string]*prometheus.GaugeVec // Pre-registered gauges
 }
 
 type QueryJob struct {
     Query      Query
     Connection Connection
     Context    context.Context
+    RetryCount int // Added for DLQ retry limit
 }
 
 func NewApplication(configFile string) (*Application, error) {
@@ -124,6 +126,7 @@ func NewApplication(configFile string) (*Application, error) {
         circuitBreakers: make(map[string]*hystrix.Client),
         dlq:            NewDeadLetterQueue(config.GlobalConfig.LogPath),
         shutdown:       make(chan struct{}),
+        gauges:         make(map[string]*prometheus.GaugeVec),
     }
 
     for _, conn := range config.Connections {
@@ -144,7 +147,8 @@ func NewApplication(configFile string) (*Application, error) {
         )
     }
 
-    app.loadCircuitBreakerState() // Load persisted state
+    app.loadCircuitBreakerState()
+    app.initGauges() // Initialize gauges
 
     for i := 0; i < config.GlobalConfig.WorkerPoolSize; i++ {
         app.wg.Add(1)
@@ -153,12 +157,30 @@ func NewApplication(configFile string) (*Application, error) {
 
     app.scheduleQueries()
     app.server = app.startHTTPServer()
-    app.dlq.ProcessRetries(app) // Start DLQ retry mechanism
+    app.dlq.ProcessRetries(app)
 
     go app.watchConfig(configFile)
     go app.watchCertificates()
 
     return app, nil
+}
+
+func (app *Application) initGauges() {
+    for _, q := range app.config.Queries {
+        for _, g := range q.Gauges {
+            key := q.Name + "_" + g.Name
+            app.gauges[key] = prometheus.NewGaugeVec(
+                prometheus.GaugeOpts{
+                    Name: g.Name,
+                    Help: g.Desc,
+                },
+                []string{"dbinstance", "dbenv", "time"}, // All possible label keys
+            )
+            if err := prometheus.Register(app.gauges[key]); err != nil {
+                logrus.Errorf("Failed to register gauge %s: %v", g.Name, err)
+            }
+        }
+    }
 }
 
 func (app *Application) worker() {
@@ -229,11 +251,12 @@ func (app *Application) executeQuery(job QueryJob) {
     for _, gauge := range job.Query.Gauges {
         value := results[gauge.Col-1]
         labels := utils.MergeLabels(job.Connection.ExtraLabels, gauge.ExtraLabels)
-        prometheus.MustRegister(prometheus.NewGauge(prometheus.GaugeOpts{
-            Name:        gauge.Name,
-            Help:        gauge.Desc,
-            ConstLabels: labels,
-        })).Set(value)
+        key := job.Query.Name + "_" + gauge.Name
+        if g, ok := app.gauges[key]; ok {
+            g.With(labels).Set(value)
+        } else {
+            logger.Errorf("Gauge %s not found for query %s", gauge.Name, job.Query.Name)
+        }
     }
 }
 
@@ -304,8 +327,8 @@ func (app *Application) startHTTPServer() *http.Server {
 
     if app.config.GlobalConfig.UseHTTPS {
         tlsConfig := &tls.Config{
-            MinVersion: tls.VersionTLS13, // Enforce modern TLS
-            CipherSuites: []uint16{       // Prefer strong ciphers
+            MinVersion: tls.VersionTLS13,
+            CipherSuites: []uint16{
                 tls.TLS_AES_128_GCM_SHA256,
                 tls.TLS_AES_256_GCM_SHA384,
             },
@@ -382,6 +405,8 @@ func (app *Application) Shutdown() {
 }
 
 func (app *Application) watchConfig(filename string) {
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
     watcher, err := fsnotify.NewWatcher()
     if err != nil {
         logrus.Fatalf("Failed to create config watcher: %v", err)
@@ -417,11 +442,15 @@ func (app *Application) watchConfig(filename string) {
             logrus.Errorf("Config watcher error: %v", err)
         case <-app.shutdown:
             return
+        case <-ctx.Done():
+            return
         }
     }
 }
 
 func (app *Application) watchCertificates() {
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
     watcher, err := fsnotify.NewWatcher()
     if err != nil {
         logrus.Fatalf("Failed to create certificate watcher: %v", err)
@@ -462,6 +491,8 @@ func (app *Application) watchCertificates() {
             }
             logrus.Errorf("Certificate watcher error: %v", err)
         case <-app.shutdown:
+            return
+        case <-ctx.Done():
             return
         }
     }
@@ -518,7 +549,6 @@ func (app *Application) loadCircuitBreakerState() {
             case 1: // Open
                 cb.Execute(func() (interface{}, error) { return nil, fmt.Errorf("force open") }, nil)
             case 2: // Half-open
-                // Heimdall doesn’t directly support setting half-open; simulate with a single failure
                 cb.Execute(func() (interface{}, error) { return nil, fmt.Errorf("half-open hint") }, nil)
             }
             logrus.Infof("Restored circuit breaker state for %s: %d", db, s)
@@ -536,7 +566,6 @@ func loadConfig(filename string) (Config, error) {
         return config, fmt.Errorf("unmarshaling YAML: %v", err)
     }
 
-    // Validation
     if config.GlobalConfig.RetryConnInterval < 0 {
         return config, fmt.Errorf("retry_conn_interval cannot be negative")
     }
@@ -549,13 +578,12 @@ func loadConfig(filename string) (Config, error) {
         }
     }
 
-    // Determine environment: prefer config value, fall back to os.Getenv
     env := config.GlobalConfig.Env
     if env == "" {
         env = os.Getenv("ENV")
     }
     if env == "" {
-        env = "production" // Default to production if not specified
+        env = "production"
         logrus.Warn("Environment not specified in config or ENV; defaulting to production")
     }
     isDev := env == "development"
@@ -584,7 +612,6 @@ func loadConfig(filename string) (Config, error) {
         return config, fmt.Errorf("encryption_key must be set in production")
     }
 
-    // Set defaults
     if config.GlobalConfig.WorkerPoolSize == 0 {
         config.GlobalConfig.WorkerPoolSize = 10
     }

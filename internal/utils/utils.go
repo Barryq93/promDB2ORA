@@ -65,6 +65,9 @@ func ShouldRunQuery(query app.Query, conn app.Connection) bool {
 }
 
 func Encrypt(key, text string) (string, error) {
+    if len(key) != 32 {
+        return "", fmt.Errorf("key must be 32 bytes long for AES-256, got %d", len(key))
+    }
     block, err := aes.NewCipher([]byte(key))
     if err != nil {
         return "", fmt.Errorf("creating cipher: %v", err)

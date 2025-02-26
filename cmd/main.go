@@ -2,6 +2,7 @@ package main
 
 import (
     "flag"
+    "fmt"
     "log"
     "os"
     "os/signal"
@@ -13,6 +14,10 @@ import (
 )
 
 var (
+    // Version and BuildTime set via -ldflags during build
+    Version   = "unknown"
+    BuildTime = "unknown"
+
     logger           = logrus.New()
     queryLatencyHist = prometheus.NewHistogramVec(
         prometheus.HistogramOpts{
@@ -52,7 +57,6 @@ var (
 )
 
 func init() {
-    // Set up logging with environment-specific configuration
     logger.SetFormatter(&logrus.JSONFormatter{
         FieldMap: logrus.FieldMap{
             logrus.FieldKeyMsg:  "message",
@@ -61,20 +65,30 @@ func init() {
     })
     logger.SetOutput(os.Stdout)
     if level := os.Getenv("LOG_LEVEL"); level != "" {
-        app.SetLogLevel(level) // Use utils function
+        app.SetLogLevel(level)
     }
 
-    // Register Prometheus metrics
-    prometheus.MustRegister(queryLatencyHist, errorCounter, workerQueueGauge, circuitBreakerState, retryAttempts)
+    metrics := []prometheus.Collector{queryLatencyHist, errorCounter, workerQueueGauge, circuitBreakerState, retryAttempts}
+    for _, metric := range metrics {
+        if err := prometheus.Register(metric); err != nil {
+            logger.Errorf("Failed to register metric: %v", err)
+        }
+    }
 }
 
 func main() {
     configFile := flag.String("config", "config.yml", "Path to configuration file")
+    version := flag.Bool("version", false, "Print version information and exit")
     flag.Parse()
+
+    if *version {
+        fmt.Printf("db-monitoring-app version %s (built %s)\n", Version, BuildTime)
+        os.Exit(0)
+    }
 
     application, err := app.NewApplication(*configFile)
     if err != nil {
-        log.Fatalf("Failed to initialize application: %v", err) // Fatal exits cleanly
+        log.Fatalf("Failed to initialize application: %v", err)
     }
 
     sigChan := make(chan os.Signal, 1)

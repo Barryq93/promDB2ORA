@@ -1,4 +1,4 @@
-module db-monitoring-app
+module promDB2ORA
 
 go 1.20
 

@@ -22,12 +22,31 @@ func NewDeadLetterQueue(path string) *DeadLetterQueue {
     if err := os.MkdirAll(dlq.path, 0755); err != nil {
         logrus.Errorf("Failed to create DLQ directory: %v", err)
     }
+    archivePath := filepath.Join(path, "dead_letter_archive")
+    if err := os.MkdirAll(archivePath, 0755); err != nil {
+        logrus.Errorf("Failed to create DLQ archive directory: %v", err)
+    }
     return dlq
 }
 
 func (dlq *DeadLetterQueue) Add(job QueryJob) {
     dlq.mu.Lock()
     defer dlq.mu.Unlock()
+
+    job.RetryCount++
+    if job.RetryCount > 5 { // Max retries
+        logrus.Errorf("Query %s exceeded retry limit, archiving", job.Query.Name)
+        archivePath := filepath.Join(filepath.Dir(dlq.path), "dead_letter_archive", fmt.Sprintf("%d_%s.json", time.Now().UnixNano(), job.Query.Name))
+        data, err := json.Marshal(job)
+        if err != nil {
+            logrus.Errorf("Failed to marshal archived DLQ job: %v", err)
+            return
+        }
+        if err := ioutil.WriteFile(archivePath, data, 0644); err != nil {
+            logrus.Errorf("Failed to write archived DLQ job: %v", err)
+        }
+        return
+    }
 
     data, err := json.Marshal(job)
     if err != nil {

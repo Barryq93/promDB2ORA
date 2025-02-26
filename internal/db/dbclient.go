@@ -26,9 +26,21 @@ func NewDBClient(conn app.Connection) (*DBClient, error) {
     var err error
 
     tlsConfig := &tls.Config{
-        ServerName: conn.DBHost, // Validate hostname
-        MinVersion: tls.VersionTLS13,
+        ServerName: conn.DBHost,
+        MinVersion: tls.VersionTLS12, // Default to TLS 1.2 for broader compatibility
     }
+    // Optional: Add TLSMinVersion to Connection struct and config.yml
+    // if conn.TLSMinVersion != "" {
+    //     switch conn.TLSMinVersion {
+    //     case "TLS1.2":
+    //         tlsConfig.MinVersion = tls.VersionTLS12
+    //     case "TLS1.3":
+    //         tlsConfig.MinVersion = tls.VersionTLS13
+    //     default:
+    //         return nil, fmt.Errorf("unsupported TLS min version: %s", conn.TLSMinVersion)
+    //     }
+    // }
+
     if conn.TLSEnabled {
         cert, err := tls.LoadX509KeyPair(conn.TLSCertFile, conn.TLSKeyFile)
         if err != nil {
@@ -77,6 +89,7 @@ func NewDBClient(conn app.Connection) (*DBClient, error) {
     }
 
     db.SetMaxOpenConns(conn.MaxConns)
+    db.SetMaxIdleConns(conn.MaxConns / 2) // Optimize connection pooling
     db.SetConnMaxIdleTime(time.Duration(conn.IdleTimeout) * time.Second)
 
     client := &DBClient{conn: db, dbType: conn.DBType, name: conn.DBName}

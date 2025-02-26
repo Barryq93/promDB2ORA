@@ -11,11 +11,9 @@ import (
     "os"
 )
 
-// Encrypt encrypts a plaintext string with the given key using AES-GCM.
-// Returns the base64-encoded result (nonce + ciphertext).
 func Encrypt(key, text string) (string, error) {
     if len(key) != 32 {
-        return "", fmt.Errorf("key must be 32 bytes long for AES-256")
+        return "", fmt.Errorf("key must be 32 bytes long for AES-256, got %d", len(key))
     }
 
     block, err := aes.NewCipher([]byte(key))
@@ -54,6 +52,12 @@ func main() {
         os.Exit(1)
     }
 
-    fmt.Printf("Encrypted value: %s\n", encrypted)
-    fmt.Println("Copy this value into your config.yml for fields like db_passwd or basic_auth.password.")
+    if _, err := fmt.Printf("Encrypted value: %s\n", encrypted); err != nil {
+        fmt.Fprintf(os.Stderr, "Failed to print output: %v\n", err)
+        os.Exit(1)
+    }
+    if _, err := fmt.Println("Copy this value into your config.yml for fields like db_passwd or basic_auth.password."); err != nil {
+        fmt.Fprintf(os.Stderr, "Failed to print output: %v\n", err)
+        os.Exit(1)
+    }
 }
