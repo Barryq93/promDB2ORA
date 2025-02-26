@@ -2,7 +2,6 @@ package main
 
 import (
 	"flag"
-	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -67,14 +66,23 @@ func init() {
 	prometheus.MustRegister(queryLatencyHist, errorCounter, workerQueueGauge, circuitBreakerState, retryAttempts)
 }
 
+func getEnvOrDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
 func main() {
-	configFile := flag.String("config", "config.yml", "Path to configuration file")
+	configFile := flag.String("config", getEnvOrDefault("CONFIG_FILE", "config.yml"), "Path to configuration file")
 	flag.Parse()
 
 	application, err := app.NewApplication(*configFile)
 	if err != nil {
-		log.Fatalf("Failed to initialize application: %v", err)
+		logger.Errorf("Failed to initialize application: %v", err)
+		os.Exit(1)
 	}
+	defer application.Shutdown()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -82,6 +90,4 @@ func main() {
 	logger.Info("Application started successfully")
 	<-sigChan
 	logger.Info("Shutdown signal received")
-	application.Shutdown()
-	logger.Info("Application shutdown complete")
 }

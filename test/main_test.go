@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,11 +12,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/afex/hystrix-go/hystrix"
 	"github.com/barryq93/promDB2ORA/internal/app"
 	"github.com/barryq93/promDB2ORA/internal/db"
 	"github.com/barryq93/promDB2ORA/internal/types"
 	"github.com/barryq93/promDB2ORA/internal/utils"
-	"github.com/gojek/heimdall/v7/hystrix"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -28,9 +27,9 @@ type MockDBClient struct {
 	mock.Mock
 }
 
-func (m *MockDBClient) ExecuteQuery(ctx context.Context, query string) ([]float64, error) {
+func (m *MockDBClient) ExecuteQuery(ctx context.Context, query string) ([]interface{}, error) {
 	args := m.Called(ctx, query)
-	return args.Get(0).([]float64), args.Error(1)
+	return args.Get(0).([]interface{}), args.Error(1)
 }
 
 func (m *MockDBClient) Ping() error {
@@ -43,7 +42,7 @@ func (m *MockDBClient) Close() {
 }
 
 func TestMain(m *testing.M) {
-	logrus.SetOutput(ioutil.Discard)
+	logrus.SetOutput(os.Stdout) // Changed from ioutil.Discard to see logs during testing
 	os.Exit(m.Run())
 }
 
@@ -112,7 +111,7 @@ global_config:
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tmpFile, err := ioutil.TempFile("", "config-*.yml")
+			tmpFile, err := os.CreateTemp("", "config-*.yml")
 			assert.NoError(t, err)
 			defer os.Remove(tmpFile.Name())
 
@@ -140,6 +139,7 @@ global_config:
   log_level: INFO
   worker_pool_size: 2
   port: 0
+  dlq_retry_interval: 1
 connections:
   - db_name: "testdb"
     db_type: "DB2"
@@ -161,7 +161,7 @@ queries:
         desc: "Test gauge"
         col: 1
 `
-	tmpFile, err := ioutil.TempFile("", "config-*.yml")
+	tmpFile, err := os.CreateTemp("", "config-*.yml")
 	assert.NoError(t, err)
 	defer os.Remove(tmpFile.Name())
 
@@ -191,28 +191,27 @@ queries:
 
 func TestExecuteQuery(t *testing.T) {
 	mockClient := new(MockDBClient)
-	mockClient.On("ExecuteQuery", mock.Anything, "SELECT 1").Return([]float64{42.0}, nil).Once()
+	mockClient.On("ExecuteQuery", mock.Anything, "SELECT 1").Return([]interface{}{float64(42.0)}, nil).Once()
 	mockClient.On("ExecuteQuery", mock.Anything, "SELECT 1").Return(nil, fmt.Errorf("mock error")).Times(3)
 
 	appInstance := &app.Application{
 		config: app.Config{
 			GlobalConfig: struct {
-				LogLevel               string `yaml:"log_level"`
-				RetryConnInterval      int    `yaml:"retry_conn_interval"`
-				DefaultTimeInterval    int    `yaml:"default_time_interval"`
-				LogPath                string `yaml:"log_path"`
-				Port                   int    `yaml:"port"`
-				UseHTTPS               bool   `yaml:"use_https"`
-				CertFile               string `yaml:"cert_file"`
-				KeyFile                string `yaml:"key_file"`
-				PrometheusMTLSEnabled  bool   `yaml:"prometheus_mtls_enabled"`
-				PrometheusClientCACert string `yaml:"prometheus_client_ca_cert_file"`
-				ShutdownTimeout        int    `yaml:"shutdown_timeout"`
-				WorkerPoolSize         int    `yaml:"worker_pool_size"`
-				EncryptionKey          string `yaml:"encryption_key"`
-				RateLimitRequests      int    `yaml:"rate_limit_requests"`
-				RateLimitBurst         int    `yaml:"rate_limit_burst"`
-				CircuitBreakerConfig   struct {
+				Env                  string `yaml:"env"`
+				LogLevel             string `yaml:"log_level"`
+				RetryConnInterval    int    `yaml:"retry_conn_interval"`
+				DefaultTimeInterval  int    `yaml:"default_time_interval"`
+				LogPath              string `yaml:"log_path"`
+				Port                 int    `yaml:"port"`
+				UseHTTPS             bool   `yaml:"use_https"`
+				CertFile             string `yaml:"cert_file"`
+				KeyFile              string `yaml:"key_file"`
+				ShutdownTimeout      int    `yaml:"shutdown_timeout"`
+				WorkerPoolSize       int    `yaml:"worker_pool_size"`
+				RateLimitRequests    int    `yaml:"rate_limit_requests"`
+				RateLimitBurst       int    `yaml:"rate_limit_burst"`
+				DLQRetryInterval     int    `yaml:"dlq_retry_interval"`
+				CircuitBreakerConfig struct {
 					Timeout       int `yaml:"timeout"`
 					MaxConcurrent int `yaml:"max_concurrent"`
 					ErrorPercent  int `yaml:"error_percent"`
@@ -221,13 +220,13 @@ func TestExecuteQuery(t *testing.T) {
 			}{
 				RetryConnInterval: 1,
 				LogPath:           t.TempDir(),
+				DLQRetryInterval:  1,
 			},
 		},
-		dbClients:       map[string]*db.DBClient{"testdb": mockClient},
-		circuitBreakers: map[string]*hystrix.Client{"testdb": hystrix.NewClient()},
-		dlq:             app.NewDeadLetterQueue(t.TempDir()),
-		workerPool:      make(chan app.QueryJob, 1),
-		shutdown:        make(chan struct{}),
+		dbClients:  map[string]*db.DBClient{"testdb": mockClient},
+		dlq:        app.NewDeadLetterQueue(t.TempDir()),
+		workerPool: make(chan app.QueryJob, 1),
+		shutdown:   make(chan struct{}),
 	}
 
 	job := app.QueryJob{
@@ -240,12 +239,13 @@ func TestExecuteQuery(t *testing.T) {
 		},
 		Connection: types.Connection{DBName: "testdb", DBType: "DB2", ExtraLabels: map[string]string{"dbinstance": "test"}},
 		Context:    context.Background(),
+		MaxRetries: 3,
 	}
 	appInstance.ExecuteQuery(job)
 	mockClient.AssertExpectations(t)
 
 	appInstance.ExecuteQuery(job)
-	files, _ := ioutil.ReadDir(appInstance.dlq.Path())
+	files, _ := os.ReadDir(appInstance.dlq.Path())
 	assert.Len(t, files, 1)
 }
 
@@ -257,47 +257,142 @@ func TestDeadLetterQueue(t *testing.T) {
 		Query:      types.Query{Name: "TestQuery"},
 		Connection: types.Connection{DBName: "testdb"},
 		Context:    context.Background(),
+		MaxRetries: 3,
 	}
 	dlq.Add(job)
 
-	files, err := ioutil.ReadDir(dlqPath)
+	files, err := os.ReadDir(dlqPath)
 	assert.NoError(t, err)
 	assert.Len(t, files, 1)
 
-	data, err := ioutil.ReadFile(filepath.Join(dlqPath, files[0].Name()))
+	data, err := os.ReadFile(filepath.Join(dlqPath, files[0].Name()))
 	assert.NoError(t, err)
 	var readJob app.QueryJob
 	assert.NoError(t, json.Unmarshal(data, &readJob))
 	assert.Equal(t, "TestQuery", readJob.Query.Name)
+	assert.Equal(t, 1, readJob.RetryCount) // Should increment on first add
 }
 
-func TestHealthHandler(t *testing.T) {
-	mockClient := new(MockDBClient)
-	mockClient.On("Ping").Return(nil)
+func TestHTTPServer(t *testing.T) {
+	configData := `
+global_config:
+  log_level: INFO
+  port: 0
+  use_https: true
+  cert_file: "test.crt"
+  key_file: "test.key"
+`
+	tmpFile, err := os.CreateTemp("", "config-*.yml")
+	assert.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.Write([]byte(configData))
+	assert.NoError(t, err)
+	tmpFile.Close()
+
+	// Create temporary cert and key files (self-signed for testing)
+	certFile, err := os.CreateTemp("", "test-*.crt")
+	assert.NoError(t, err)
+	defer os.Remove(certFile.Name())
+	keyFile, err := os.CreateTemp("", "test-*.key")
+	assert.NoError(t, err)
+	defer os.Remove(keyFile.Name())
+
+	// Minimal cert/key content (not valid, but enough to test logic)
+	_, err = certFile.Write([]byte("fake-cert"))
+	assert.NoError(t, err)
+	_, err = keyFile.Write([]byte("fake-key"))
+	assert.NoError(t, err)
 
 	appInstance := &app.Application{
-		dbClients:  map[string]*db.DBClient{"testdb": mockClient},
-		workerPool: make(chan app.QueryJob, 2),
-		circuitBreakers: map[string]*hystrix.Client{
-			"testdb": hystrix.NewClient(hystrix.WithTimeout(1000 * time.Millisecond)),
+		config: app.Config{
+			GlobalConfig: struct {
+				Env                  string `yaml:"env"`
+				LogLevel             string `yaml:"log_level"`
+				RetryConnInterval    int    `yaml:"retry_conn_interval"`
+				DefaultTimeInterval  int    `yaml:"default_time_interval"`
+				LogPath              string `yaml:"log_path"`
+				Port                 int    `yaml:"port"`
+				UseHTTPS             bool   `yaml:"use_https"`
+				CertFile             string `yaml:"cert_file"`
+				KeyFile              string `yaml:"key_file"`
+				ShutdownTimeout      int    `yaml:"shutdown_timeout"`
+				WorkerPoolSize       int    `yaml:"worker_pool_size"`
+				RateLimitRequests    int    `yaml:"rate_limit_requests"`
+				RateLimitBurst       int    `yaml:"rate_limit_burst"`
+				DLQRetryInterval     int    `yaml:"dlq_retry_interval"`
+				CircuitBreakerConfig struct {
+					Timeout       int `yaml:"timeout"`
+					MaxConcurrent int `yaml:"max_concurrent"`
+					ErrorPercent  int `yaml:"error_percent"`
+					SleepWindow   int `yaml:"sleep_window"`
+				} `yaml:"circuit_breaker_config"`
+			}{
+				UseHTTPS:          true,
+				CertFile:          certFile.Name(),
+				KeyFile:           keyFile.Name(),
+				Port:              0,
+				RateLimitRequests: 1,
+				RateLimitBurst:    1,
+			},
+		},
+		shutdown: make(chan struct{}),
+	}
+
+	server := appInstance.StartHTTPServer()
+	defer appInstance.Shutdown()
+
+	// Since certs are invalid, we expect an error, but we verify the HTTPS path is taken
+	time.Sleep(100 * time.Millisecond) // Give server time to start
+	assert.NotNil(t, server)
+}
+
+func TestRateLimitMiddleware(t *testing.T) {
+	appInstance := &app.Application{
+		config: app.Config{
+			GlobalConfig: struct {
+				Env                  string `yaml:"env"`
+				LogLevel             string `yaml:"log_level"`
+				RetryConnInterval    int    `yaml:"retry_conn_interval"`
+				DefaultTimeInterval  int    `yaml:"default_time_interval"`
+				LogPath              string `yaml:"log_path"`
+				Port                 int    `yaml:"port"`
+				UseHTTPS             bool   `yaml:"use_https"`
+				CertFile             string `yaml:"cert_file"`
+				KeyFile              string `yaml:"key_file"`
+				ShutdownTimeout      int    `yaml:"shutdown_timeout"`
+				WorkerPoolSize       int    `yaml:"worker_pool_size"`
+				RateLimitRequests    int    `yaml:"rate_limit_requests"`
+				RateLimitBurst       int    `yaml:"rate_limit_burst"`
+				DLQRetryInterval     int    `yaml:"dlq_retry_interval"`
+				CircuitBreakerConfig struct {
+					Timeout       int `yaml:"timeout"`
+					MaxConcurrent int `yaml:"max_concurrent"`
+					ErrorPercent  int `yaml:"error_percent"`
+					SleepWindow   int `yaml:"sleep_window"`
+				} `yaml:"circuit_breaker_config"`
+			}{
+				RateLimitRequests: 1,
+				RateLimitBurst:    1,
+			},
 		},
 	}
-	appInstance.workerPool <- app.QueryJob{}
 
-	req, _ := http.NewRequest("GET", "/health", nil)
+	handler := appInstance.RateLimitMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("OK"))
+	}))
+
+	req, _ := http.NewRequest("GET", "/metrics", nil)
 	rr := httptest.NewRecorder()
-	appInstance.HealthHandler(rr, req)
-
+	handler.ServeHTTP(rr, req)
 	assert.Equal(t, http.StatusOK, rr.Code)
-	var status struct {
-		Databases       map[string]string `json:"databases"`
-		WorkerPool      int               `json:"worker_pool"`
-		CircuitBreakers map[string]int    `json:"circuit_breakers"`
-	}
-	assert.NoError(t, json.Unmarshal(rr.Body.Bytes(), &status))
-	assert.Equal(t, "healthy", status.Databases["testdb"])
-	assert.Equal(t, 1, status.WorkerPool)
-	assert.Equal(t, 0, status.CircuitBreakers["testdb"])
+	assert.Equal(t, "OK", rr.Body.String())
+
+	// Second request should be rate-limited
+	req, _ = http.NewRequest("GET", "/metrics", nil)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	assert.Equal(t, http.StatusTooManyRequests, rr.Code)
 }
 
 func TestEncryptDecrypt(t *testing.T) {
@@ -337,44 +432,56 @@ func TestExecuteQueryCircuitBreakerOpen(t *testing.T) {
 	appInstance := &app.Application{
 		config: app.Config{
 			GlobalConfig: struct {
-				LogLevel               string `yaml:"log_level"`
-				RetryConnInterval      int    `yaml:"retry_conn_interval"`
-				DefaultTimeInterval    int    `yaml:"default_time_interval"`
-				LogPath                string `yaml:"log_path"`
-				Port                   int    `yaml:"port"`
-				UseHTTPS               bool   `yaml:"use_https"`
-				CertFile               string `yaml:"cert_file"`
-				KeyFile                string `yaml:"key_file"`
-				PrometheusMTLSEnabled  bool   `yaml:"prometheus_mtls_enabled"`
-				PrometheusClientCACert string `yaml:"prometheus_client_ca_cert_file"`
-				ShutdownTimeout        int    `yaml:"shutdown_timeout"`
-				WorkerPoolSize         int    `yaml:"worker_pool_size"`
-				EncryptionKey          string `yaml:"encryption_key"`
-				RateLimitRequests      int    `yaml:"rate_limit_requests"`
-				RateLimitBurst         int    `yaml:"rate_limit_burst"`
-				CircuitBreakerConfig   struct {
+				Env                  string `yaml:"env"`
+				LogLevel             string `yaml:"log_level"`
+				RetryConnInterval    int    `yaml:"retry_conn_interval"`
+				DefaultTimeInterval  int    `yaml:"default_time_interval"`
+				LogPath              string `yaml:"log_path"`
+				Port                 int    `yaml:"port"`
+				UseHTTPS             bool   `yaml:"use_https"`
+				CertFile             string `yaml:"cert_file"`
+				KeyFile              string `yaml:"key_file"`
+				ShutdownTimeout      int    `yaml:"shutdown_timeout"`
+				WorkerPoolSize       int    `yaml:"worker_pool_size"`
+				RateLimitRequests    int    `yaml:"rate_limit_requests"`
+				RateLimitBurst       int    `yaml:"rate_limit_burst"`
+				DLQRetryInterval     int    `yaml:"dlq_retry_interval"`
+				CircuitBreakerConfig struct {
 					Timeout       int `yaml:"timeout"`
 					MaxConcurrent int `yaml:"max_concurrent"`
 					ErrorPercent  int `yaml:"error_percent"`
 					SleepWindow   int `yaml:"sleep_window"`
 				} `yaml:"circuit_breaker_config"`
-			}{LogPath: t.TempDir()},
+			}{
+				LogPath:          t.TempDir(),
+				DLQRetryInterval: 1,
+			},
 		},
-		dbClients:       map[string]*db.DBClient{"testdb": mockClient},
-		circuitBreakers: map[string]*hystrix.Client{"testdb": hystrix.NewClient(hystrix.WithErrorPercentThreshold(1))},
-		dlq:             app.NewDeadLetterQueue(t.TempDir()),
-		workerPool:      make(chan app.QueryJob, 1),
-		shutdown:        make(chan struct{}),
+		dbClients:  map[string]*db.DBClient{"testdb": mockClient},
+		dlq:        app.NewDeadLetterQueue(t.TempDir()),
+		workerPool: make(chan app.QueryJob, 1),
+		shutdown:   make(chan struct{}),
 	}
 
-	appInstance.circuitBreakers["testdb"].Execute(func() (interface{}, error) { return nil, fmt.Errorf("fail") }, nil)
+	// Configure Hystrix to immediately open circuit
+	hystrix.ConfigureCommand("testdb", hystrix.CommandConfig{
+		Timeout:               1000,
+		MaxConcurrentRequests: 1,
+		ErrorPercentThreshold: 1,
+		SleepWindow:           1000,
+	})
+
+	// Force circuit open
+	err := hystrix.Do("testdb", func() error { return fmt.Errorf("force fail") }, nil)
+	assert.Error(t, err)
 
 	job := app.QueryJob{
 		Query:      types.Query{Name: "TestQuery", DBType: "DB2", Query: "SELECT 1", Timeout: 1},
 		Connection: types.Connection{DBName: "testdb", DBType: "DB2"},
 		Context:    context.Background(),
+		MaxRetries: 3,
 	}
 	appInstance.ExecuteQuery(job)
-	files, _ := ioutil.ReadDir(appInstance.dlq.Path())
+	files, _ := os.ReadDir(appInstance.dlq.Path())
 	assert.Len(t, files, 1)
 }

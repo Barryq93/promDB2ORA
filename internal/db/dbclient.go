@@ -6,10 +6,11 @@ import (
 	"crypto/x509"
 	"database/sql"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"time"
 
 	"github.com/barryq93/promDB2ORA/internal/types"
+	_ "github.com/godror/godror"
 	_ "github.com/ibmdb/go_ibm_db"
 	"github.com/sirupsen/logrus"
 )
@@ -33,7 +34,7 @@ func NewDBClient(conn types.Connection) (*DBClient, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to load client certificate: %v", err)
 		}
-		caCert, err := ioutil.ReadFile(conn.TLSCACertFile)
+		caCert, err := os.ReadFile(conn.TLSCACertFile)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read CA certificate: %v", err)
 		}
@@ -48,7 +49,7 @@ func NewDBClient(conn types.Connection) (*DBClient, error) {
 		dsn := fmt.Sprintf("HOSTNAME=%s;PORT=%d;DATABASE=%s;UID=%s;PWD=%s",
 			conn.DBHost, conn.DBPort, conn.DBName, conn.DBUser, conn.DBPasswd)
 		if conn.TLSEnabled {
-			dsn += ";SECURITY=SSL" // go_ibm_db handles TLS via SECURITY=SSL
+			dsn += ";SECURITY=SSL"
 		}
 		db, err = sql.Open("go_ibm_db", dsn)
 		if err != nil {
@@ -58,11 +59,7 @@ func NewDBClient(conn types.Connection) (*DBClient, error) {
 		dsn := fmt.Sprintf("%s/%s@%s:%d/%s",
 			conn.DBUser, conn.DBPasswd, conn.DBHost, conn.DBPort, conn.DBName)
 		if conn.TLSEnabled {
-			// For godror v0.44.2, use connection string parameters for SSL
-			// Note: Custom TLSConfig isn't directly supported; certificates must be system-trusted or configured externally
-			dsn += "?ssl=true&ssl_verify=true"
-			// Warning: godror relies on system trust store or wallet for custom certs; tlsConfig isn't passed directly
-			logrus.Warnf("TLS enabled for Oracle, but custom certificates (%s, %s, %s) may require system trust store configuration.",
+			dsn += fmt.Sprintf("?ssl=true&ssl_verify=true&ssl_client_certificate=%s&ssl_client_key=%s&ssl_root_certificate=%s",
 				conn.TLSCertFile, conn.TLSKeyFile, conn.TLSCACertFile)
 		}
 		db, err = sql.Open("godror", dsn)
@@ -84,7 +81,7 @@ func NewDBClient(conn types.Connection) (*DBClient, error) {
 	return client, nil
 }
 
-func (c *DBClient) ExecuteQuery(ctx context.Context, query string) ([]float64, error) {
+func (c *DBClient) ExecuteQuery(ctx context.Context, query string) ([]interface{}, error) {
 	stats := c.conn.Stats()
 	if stats.OpenConnections >= stats.MaxOpenConnections {
 		logrus.Warnf("DB connection pool for %s (%s) at capacity: %d/%d", c.name, c.dbType, stats.OpenConnections, stats.MaxOpenConnections)
@@ -96,19 +93,18 @@ func (c *DBClient) ExecuteQuery(ctx context.Context, query string) ([]float64, e
 	}
 	defer rows.Close()
 
-	var results []float64
+	var results []interface{}
 	for rows.Next() {
-		var values []interface{}
 		columns, _ := rows.Columns()
-		for range columns {
-			values = append(values, new(float64))
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+		for i := range values {
+			valuePtrs[i] = &values[i]
 		}
-		if err := rows.Scan(values...); err != nil {
+		if err := rows.Scan(valuePtrs...); err != nil {
 			return nil, fmt.Errorf("scanning row failed: %v", err)
 		}
-		for _, v := range values {
-			results = append(results, *v.(*float64))
-		}
+		results = append(results, values...)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("row iteration failed: %v", err)

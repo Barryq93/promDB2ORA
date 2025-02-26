@@ -3,31 +3,30 @@ package app
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
-	"github.com/afex/hystrix-go/hystrix" // Import hystrix-go
+	"github.com/afex/hystrix-go/hystrix"
 	"github.com/barryq93/promDB2ORA/internal/db"
 	"github.com/barryq93/promDB2ORA/internal/types"
 	"github.com/barryq93/promDB2ORA/internal/utils"
+	"github.com/fsnotify/fsnotify"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v3"
 )
 
-// ========================
-// 🔹 Global Prometheus Metrics
-// ========================
 var (
 	logger = logrus.New()
 
 	circuitBreakerState = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "circuit_breaker_state",
-			Help: "Current state of circuit breakers (0=closed, 1=open, 2=half-open)",
+			Help: "Current state of circuit breakers (0=closed, 1=open)",
 		},
 		[]string{"db_name"},
 	)
@@ -55,9 +54,6 @@ var (
 	)
 )
 
-// ========================
-// 🔹 Config Struct
-// ========================
 type Config struct {
 	GlobalConfig struct {
 		Env                  string `yaml:"env"`
@@ -73,6 +69,7 @@ type Config struct {
 		WorkerPoolSize       int    `yaml:"worker_pool_size"`
 		RateLimitRequests    int    `yaml:"rate_limit_requests"`
 		RateLimitBurst       int    `yaml:"rate_limit_burst"`
+		DLQRetryInterval     int    `yaml:"dlq_retry_interval"`
 		CircuitBreakerConfig struct {
 			Timeout       int `yaml:"timeout"`
 			MaxConcurrent int `yaml:"max_concurrent"`
@@ -88,11 +85,9 @@ type Config struct {
 	} `yaml:"basic_auth"`
 }
 
-// ========================
-// 🔹 Application Struct
-// ========================
 type Application struct {
 	config     Config
+	mu         sync.RWMutex
 	dbClients  map[string]*db.DBClient
 	workerPool chan QueryJob
 	shutdown   chan struct{}
@@ -101,16 +96,14 @@ type Application struct {
 	dlq        *DeadLetterQueue
 }
 
-// QueryJob Struct
 type QueryJob struct {
 	Query      types.Query
 	Connection types.Connection
 	Context    context.Context
+	RetryCount int
+	MaxRetries int
 }
 
-// ========================
-// 🔹 New Application Initialization
-// ========================
 func NewApplication(configFile string) (*Application, error) {
 	config, err := LoadConfig(configFile)
 	if err != nil {
@@ -127,8 +120,14 @@ func NewApplication(configFile string) (*Application, error) {
 		dlq:        NewDeadLetterQueue(config.GlobalConfig.LogPath),
 	}
 
-	// Initialize circuit breakers
+	// Initialize DB clients
 	for _, conn := range config.Connections {
+		client, err := db.NewDBClient(conn)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create DB client for %s: %v", conn.DBName, err)
+		}
+		app.dbClients[conn.DBName] = client
+
 		cbConfig := config.GlobalConfig.CircuitBreakerConfig
 		hystrix.ConfigureCommand(conn.DBName, hystrix.CommandConfig{
 			Timeout:               cbConfig.Timeout,
@@ -138,27 +137,48 @@ func NewApplication(configFile string) (*Application, error) {
 		})
 	}
 
-	// Start workers
+	// Periodically update circuit breaker states
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				for _, conn := range config.Connections {
+					circuit, _, err := hystrix.GetCircuit(conn.DBName)
+					if err != nil {
+						logrus.Errorf("Failed to get circuit state for %s: %v", conn.DBName, err)
+						continue
+					}
+					if circuit == nil { // Circuit not yet created
+						circuitBreakerState.WithLabelValues(conn.DBName).Set(0) // Default to closed
+						continue
+					}
+					state := 0.0 // Closed
+					if circuit.IsOpen() {
+						state = 1 // Open
+					}
+					circuitBreakerState.WithLabelValues(conn.DBName).Set(state)
+				}
+			case <-app.shutdown:
+				return
+			}
+		}
+	}()
+
 	for i := 0; i < config.GlobalConfig.WorkerPoolSize; i++ {
 		app.wg.Add(1)
 		go app.worker()
 	}
 
-	// Schedule queries
 	app.scheduleQueries()
-
-	// Start HTTP server
+	go app.watchConfig(configFile)
 	app.server = app.startHTTPServer()
 
-	// Start DLQ retry processor
 	app.dlq.ProcessRetries(app)
-
 	return app, nil
 }
 
-// ========================
-// 🔹 Query Execution Worker
-// ========================
 func (app *Application) worker() {
 	defer app.wg.Done()
 	for {
@@ -171,9 +191,6 @@ func (app *Application) worker() {
 	}
 }
 
-// ========================
-// 🔹 Query Execution with Circuit Breaker
-// ========================
 func (app *Application) executeQuery(job QueryJob) {
 	logger := logrus.WithFields(logrus.Fields{
 		"query":   job.Query.Name,
@@ -183,34 +200,27 @@ func (app *Application) executeQuery(job QueryJob) {
 
 	start := time.Now()
 
-	// Wrap query execution with hystrix-go circuit breaker
 	err := hystrix.Do(job.Connection.DBName, func() error {
 		_, err := app.dbClients[job.Connection.DBName].ExecuteQuery(job.Context, job.Query.Query)
 		return err
-	}, nil) // No fallback function for simplicity
+	}, nil)
 
 	if err != nil {
 		retryAttempts.WithLabelValues(job.Query.Name, job.Query.DBType, job.Connection.DBName).Inc()
 		errorCounter.WithLabelValues(job.Query.Name, job.Query.DBType, job.Connection.DBName).Inc()
 		logger.Error("Query failed after retries, sending to dead letter queue")
 		app.dlq.Add(job)
-		// Update circuit breaker state metric
-		circuitBreakerState.WithLabelValues(job.Connection.DBName).Set(1) // Open state
 		return
 	}
-
-	// If successful, ensure circuit breaker state reflects closed
-	circuitBreakerState.WithLabelValues(job.Connection.DBName).Set(0) // Closed state
 
 	duration := time.Since(start).Seconds()
 	queryLatencyHist.WithLabelValues(job.Query.Name, job.Query.DBType, job.Connection.DBName).Observe(duration)
 	logger.Info("Query executed successfully")
 }
 
-// ========================
-// 🔹 Schedule Queries
-// ========================
 func (app *Application) scheduleQueries() {
+	app.mu.RLock()
+	defer app.mu.RUnlock()
 	for _, query := range app.config.Queries {
 		for _, conn := range app.config.Connections {
 			if utils.ShouldRunQuery(query, conn) {
@@ -226,6 +236,7 @@ func (app *Application) scheduleQueries() {
 								Query:      q,
 								Connection: c,
 								Context:    context.Background(),
+								MaxRetries: 3,
 							}
 						case <-app.shutdown:
 							return
@@ -237,12 +248,20 @@ func (app *Application) scheduleQueries() {
 	}
 }
 
-// ========================
-// 🔹 HTTP Server for Prometheus Metrics
-// ========================
+func (app *Application) rateLimitMiddleware(next http.Handler, limiter *rate.Limiter) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !limiter.Allow() {
+			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func (app *Application) startHTTPServer() *http.Server {
+	limiter := rate.NewLimiter(rate.Limit(app.config.GlobalConfig.RateLimitRequests), app.config.GlobalConfig.RateLimitBurst)
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/metrics", app.rateLimitMiddleware(promhttp.Handler(), limiter))
 
 	server := &http.Server{
 		Addr:    fmt.Sprintf(":%d", app.config.GlobalConfig.Port),
@@ -250,16 +269,19 @@ func (app *Application) startHTTPServer() *http.Server {
 	}
 
 	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logrus.Fatalf("HTTP server error: %v", err)
+		if app.config.GlobalConfig.UseHTTPS {
+			if err := server.ListenAndServeTLS(app.config.GlobalConfig.CertFile, app.config.GlobalConfig.KeyFile); err != nil && err != http.ErrServerClosed {
+				logrus.Fatalf("HTTPS server error: %v", err)
+			}
+		} else {
+			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logrus.Fatalf("HTTP server error: %v", err)
+			}
 		}
 	}()
 	return server
 }
 
-// ========================
-// 🔹 Graceful Shutdown
-// ========================
 func (app *Application) Shutdown() {
 	close(app.shutdown)
 	app.wg.Wait()
@@ -268,14 +290,14 @@ func (app *Application) Shutdown() {
 	if err := app.server.Shutdown(ctx); err != nil {
 		logrus.Errorf("Server shutdown error: %v", err)
 	}
+	for _, client := range app.dbClients {
+		client.Close()
+	}
 }
 
-// ========================
-// 🔹 Load YAML Configuration
-// ========================
 func LoadConfig(filename string) (Config, error) {
 	var config Config
-	data, err := ioutil.ReadFile(filename)
+	data, err := os.ReadFile(filename)
 	if err != nil {
 		return config, fmt.Errorf("reading file: %v", err)
 	}
@@ -283,4 +305,36 @@ func LoadConfig(filename string) (Config, error) {
 		return config, fmt.Errorf("unmarshaling YAML: %v", err)
 	}
 	return config, nil
+}
+
+func (app *Application) watchConfig(configFile string) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		logrus.Fatalf("Failed to create watcher: %v", err)
+	}
+	defer watcher.Close()
+	if err := watcher.Add(configFile); err != nil {
+		logrus.Fatalf("Failed to watch config file: %v", err)
+	}
+	for {
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			if event.Op&fsnotify.Write == fsnotify.Write {
+				newConfig, err := LoadConfig(configFile)
+				if err != nil {
+					logrus.Errorf("Failed to reload config: %v", err)
+					continue
+				}
+				app.mu.Lock()
+				app.config = newConfig
+				app.mu.Unlock()
+				logrus.Info("Configuration reloaded")
+			}
+		case <-app.shutdown:
+			return
+		}
+	}
 }
