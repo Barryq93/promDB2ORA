@@ -8,10 +8,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/afex/hystrix-go/hystrix" // Import hystrix-go
 	"github.com/barryq93/promDB2ORA/internal/db"
 	"github.com/barryq93/promDB2ORA/internal/types"
 	"github.com/barryq93/promDB2ORA/internal/utils"
-	"github.com/gojek/heimdall/v7/hystrix"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
@@ -25,9 +25,9 @@ var (
 	logger = logrus.New()
 
 	circuitBreakerState = prometheus.NewGaugeVec(
-		prometheus.GaugeughtyOpts{
+		prometheus.GaugeOpts{
 			Name: "circuit_breaker_state",
-			Help: "Current state of circuit breakers (0=closed, 1=open)",
+			Help: "Current state of circuit breakers (0=closed, 1=open, 2=half-open)",
 		},
 		[]string{"db_name"},
 	)
@@ -92,14 +92,13 @@ type Config struct {
 // 🔹 Application Struct
 // ========================
 type Application struct {
-	config          Config
-	dbClients       map[string]*db.DBClient
-	workerPool      chan QueryJob
-	circuitBreakers map[string]*hystrix.Client
-	shutdown        chan struct{}
-	wg              sync.WaitGroup
-	server          *http.Server
-	dlq             *DeadLetterQueue
+	config     Config
+	dbClients  map[string]*db.DBClient
+	workerPool chan QueryJob
+	shutdown   chan struct{}
+	wg         sync.WaitGroup
+	server     *http.Server
+	dlq        *DeadLetterQueue
 }
 
 // QueryJob Struct
@@ -121,31 +120,22 @@ func NewApplication(configFile string) (*Application, error) {
 	utils.SetLogLevel(config.GlobalConfig.LogLevel)
 
 	app := &Application{
-		config:          config,
-		dbClients:       make(map[string]*db.DBClient),
-		workerPool:      make(chan QueryJob, config.GlobalConfig.WorkerPoolSize),
-		circuitBreakers: make(map[string]*hystrix.Client),
-		shutdown:        make(chan struct{}),
-		dlq:             NewDeadLetterQueue(config.GlobalConfig.LogPath),
-	}
-
-	for _, conn := range config.Connections {
-		client, err := db.NewDBClient(conn)
-		if err != nil {
-			return nil, fmt.Errorf("initializing DB client for %s: %v", conn.DBName, err)
-		}
-		app.dbClients[conn.DBName] = client
+		config:     config,
+		dbClients:  make(map[string]*db.DBClient),
+		workerPool: make(chan QueryJob, config.GlobalConfig.WorkerPoolSize),
+		shutdown:   make(chan struct{}),
+		dlq:        NewDeadLetterQueue(config.GlobalConfig.LogPath),
 	}
 
 	// Initialize circuit breakers
 	for _, conn := range config.Connections {
 		cbConfig := config.GlobalConfig.CircuitBreakerConfig
-		app.circuitBreakers[conn.DBName] = hystrix.NewClient(
-			hystrix.WithHTTPTimeout(time.Duration(cbConfig.Timeout)*time.Millisecond),
-			hystrix.WithMaxConcurrentRequests(cbConfig.MaxConcurrent),
-			hystrix.WithErrorPercentThreshold(cbConfig.ErrorPercent),
-			hystrix.WithRetryCount(3),
-		)
+		hystrix.ConfigureCommand(conn.DBName, hystrix.CommandConfig{
+			Timeout:               cbConfig.Timeout,
+			MaxConcurrentRequests: cbConfig.MaxConcurrent,
+			ErrorPercentThreshold: cbConfig.ErrorPercent,
+			SleepWindow:           cbConfig.SleepWindow,
+		})
 	}
 
 	// Start workers
@@ -191,16 +181,13 @@ func (app *Application) executeQuery(job QueryJob) {
 		"db_name": job.Connection.DBName,
 	})
 
-	cb := app.circuitBreakers[job.Connection.DBName]
 	start := time.Now()
 
-	// Wrap query execution with circuit breaker
-	var results []float64
-	err := cb.Execute(func() (interface{}, error) {
-		var err error
-		results, err = app.dbClients[job.Connection.DBName].ExecuteQuery(job.Context, job.Query.Query)
-		return results, err
-	}, nil) // No fallback provided for simplicity
+	// Wrap query execution with hystrix-go circuit breaker
+	err := hystrix.Do(job.Connection.DBName, func() error {
+		_, err := app.dbClients[job.Connection.DBName].ExecuteQuery(job.Context, job.Query.Query)
+		return err
+	}, nil) // No fallback function for simplicity
 
 	if err != nil {
 		retryAttempts.WithLabelValues(job.Query.Name, job.Query.DBType, job.Connection.DBName).Inc()
@@ -218,19 +205,6 @@ func (app *Application) executeQuery(job QueryJob) {
 	duration := time.Since(start).Seconds()
 	queryLatencyHist.WithLabelValues(job.Query.Name, job.Query.DBType, job.Connection.DBName).Observe(duration)
 	logger.Info("Query executed successfully")
-
-	// Process results and update Prometheus metrics
-	for _, gauge := range job.Query.Gauges {
-		if gauge.Col <= len(results) {
-			metric := prometheus.NewGauge(prometheus.GaugeOpts{
-				Name:        gauge.Name,
-				Help:        gauge.Desc,
-				ConstLabels: utils.MergeLabels(job.Connection.ExtraLabels, gauge.ExtraLabels),
-			})
-			metric.Set(results[gauge.Col-1])
-			prometheus.MustRegister(metric)
-		}
-	}
 }
 
 // ========================
