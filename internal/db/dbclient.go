@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/barryq93/promDB2ORA/internal/types"
-	"github.com/godror/godror"
 	_ "github.com/ibmdb/go_ibm_db"
 	"github.com/sirupsen/logrus"
 )
@@ -50,29 +49,23 @@ func NewDBClient(conn types.Connection) (*DBClient, error) {
 			conn.DBHost, conn.DBPort, conn.DBName, conn.DBUser, conn.DBPasswd)
 		if conn.TLSEnabled {
 			dsn += ";SECURITY=SSL" // go_ibm_db handles TLS via SECURITY=SSL
-			// Note: go_ibm_db doesn't use a separate TLS config registration
 		}
 		db, err = sql.Open("go_ibm_db", dsn)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open DB2 connection: %v", err)
 		}
 	case "Oracle":
-		// Use godror.ConnectionParams for TLS configuration
-		params := godror.ConnectionParams{
-			CommonParams: godror.CommonParams{
-				Username: conn.DBUser,
-				Password: godror.NewPassword(conn.DBPasswd),
-				ConnectString: fmt.Sprintf("%s:%d/%s",
-					conn.DBHost, conn.DBPort, conn.DBName),
-			},
-		}
+		dsn := fmt.Sprintf("%s/%s@%s:%d/%s",
+			conn.DBUser, conn.DBPasswd, conn.DBHost, conn.DBPort, conn.DBName)
 		if conn.TLSEnabled {
-			params.EnableTLS = true
-			params.TLSConfig = tlsConfig
-			params.SSL = true
-			params.SSLVerify = true
+			// For godror v0.44.2, use connection string parameters for SSL
+			// Note: Custom TLSConfig isn't directly supported; certificates must be system-trusted or configured externally
+			dsn += "?ssl=true&ssl_verify=true"
+			// Warning: godror relies on system trust store or wallet for custom certs; tlsConfig isn't passed directly
+			logrus.Warnf("TLS enabled for Oracle, but custom certificates (%s, %s, %s) may require system trust store configuration.",
+				conn.TLSCertFile, conn.TLSKeyFile, conn.TLSCACertFile)
 		}
-		db, err = sql.Open("godror", params.String())
+		db, err = sql.Open("godror", dsn)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open Oracle connection: %v", err)
 		}
