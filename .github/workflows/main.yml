@@ -8,14 +8,33 @@ on:
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
+    
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
+      - name: Install IBM Data Server Driver
+        run: |
+          # Download IBM Data Server Driver for ODBC and CLI (v11.5.9 FP0 as an example)
+          wget -q "https://public.dhe.ibm.com/ibmdl/export/pub/software/data/db2/drivers/odbc_cli/linuxx64_odbc_cli.tar.gz" -O ibm-data-server-driver.tar.gz
+          tar -xzf ibm-data-server-driver.tar.gz -C /tmp
+          # Set environment variables for CGO
+          export C_INCLUDE_PATH=/tmp/clidriver/include:$C_INCLUDE_PATH
+          export LD_LIBRARY_PATH=/tmp/clidriver/lib:$LD_LIBRARY_PATH
+          # Persist these for subsequent steps
+          echo "C_INCLUDE_PATH=$C_INCLUDE_PATH" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> $GITHUB_ENV
+
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: "1.23"
+          go-version: "1.20"
+
+      - name: Install CGO dependencies
+        run: |
+          # Install gcc and libraries required for CGO
+          sudo apt-get update
+          sudo apt-get install -y gcc g++ libc6-dev
 
       - name: Build for Linux
         run: |
@@ -24,7 +43,9 @@ jobs:
 
       - name: Build for Windows
         run: |
-          CGO_ENABLED=1 GOOS=windows GOARCH=amd64 go build -o db-monitoring-app-windows-amd64.exe cmd/main.go
+          # Install mingw-w64 for Windows cross-compilation
+          sudo apt-get install -y mingw-w64
+          CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc go build -o db-monitoring-app-windows-amd64.exe cmd/main.go
           sha256sum db-monitoring-app-windows-amd64.exe > db-monitoring-app-windows-amd64.exe.sha256
 
       - name: Create Release
