@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - "v*.*.*" # Trigger on version tags (e.g., v1.0.0)
+      - "v*.*.*"
 
 jobs:
   build-and-release:
@@ -27,7 +27,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: "1.24" # Matches toolchain go1.24.0 in go.mod
+          go-version: "1.24"
 
       - name: Build for Linux
         run: |
@@ -36,10 +36,9 @@ jobs:
 
       - name: Build for Windows
         run: |
-          # Note: Windows build requires IBM driver for Windows, not included here
           echo "Warning: Building for Windows without IBM driver may fail."
-          CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc go build -o db-monitoring-app-windows-amd64.exe cmd/main.go || echo "Windows build failed as expected due to missing driver."
-          sha256sum db-monitoring-app-windows-amd64.exe > db-monitoring-app-windows-amd64.exe.sha256 2>/dev/null || echo "Checksum skipped due to build failure."
+          CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc go build -o db-monitoring-app-windows-amd64.exe cmd/main.go || echo "Windows build failed as expected."
+          sha256sum db-monitoring-app-windows-amd64.exe > db-monitoring-app-windows-amd64.exe.sha256 2>/dev/null || echo "Checksum skipped."
 
       - name: Create Release
         id: create_release
@@ -81,7 +80,7 @@ jobs:
           asset_path: ./db-monitoring-app-windows-amd64.exe
           asset_name: db-monitoring-app-windows-amd64.exe
           asset_content_type: application/octet-stream
-        continue-on-error: true # Allows workflow to proceed if Windows build fails
+        continue-on-error: true
 
       - name: Upload Windows Checksum
         uses: actions/upload-release-asset@v1
@@ -92,4 +91,4 @@ jobs:
           asset_path: ./db-monitoring-app-windows-amd64.exe.sha256
           asset_name: db-monitoring-app-windows-amd64.exe.sha256
           asset_content_type: text/plain
-        continue-on-error: true # Allows workflow to proceed if Windows build fails
+        continue-on-error: true

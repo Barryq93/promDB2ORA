@@ -49,26 +49,30 @@ func NewDBClient(conn types.Connection) (*DBClient, error) {
 		dsn := fmt.Sprintf("HOSTNAME=%s;PORT=%d;DATABASE=%s;UID=%s;PWD=%s",
 			conn.DBHost, conn.DBPort, conn.DBName, conn.DBUser, conn.DBPasswd)
 		if conn.TLSEnabled {
-			dsn += ";SECURITY=SSL"
-			tlsName := fmt.Sprintf("tls_%s", conn.DBName)
-			godror.RegisterTLSConfig(tlsName, tlsConfig)
-			db, err = sql.Open("go_ibm_db", dsn+";TLS="+tlsName)
-		} else {
-			db, err = sql.Open("go_ibm_db", dsn)
+			dsn += ";SECURITY=SSL" // go_ibm_db handles TLS via SECURITY=SSL
+			// Note: go_ibm_db doesn't use a separate TLS config registration
 		}
+		db, err = sql.Open("go_ibm_db", dsn)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open DB2 connection: %v", err)
 		}
 	case "Oracle":
-		dsn := fmt.Sprintf("%s/%s@%s:%d/%s",
-			conn.DBUser, conn.DBPasswd, conn.DBHost, conn.DBPort, conn.DBName)
-		if conn.TLSEnabled {
-			tlsName := fmt.Sprintf("tls_%s", conn.DBName)
-			godror.RegisterTLSConfig(tlsName, tlsConfig)
-			db, err = sql.Open("godror", dsn+"?ssl=true&ssl_verify=true&tls_config="+tlsName)
-		} else {
-			db, err = sql.Open("godror", dsn)
+		// Use godror.ConnectionParams for TLS configuration
+		params := godror.ConnectionParams{
+			CommonParams: godror.CommonParams{
+				Username: conn.DBUser,
+				Password: godror.NewPassword(conn.DBPasswd),
+				ConnectString: fmt.Sprintf("%s:%d/%s",
+					conn.DBHost, conn.DBPort, conn.DBName),
+			},
 		}
+		if conn.TLSEnabled {
+			params.EnableTLS = true
+			params.TLSConfig = tlsConfig
+			params.SSL = true
+			params.SSLVerify = true
+		}
+		db, err = sql.Open("godror", params.String())
 		if err != nil {
 			return nil, fmt.Errorf("failed to open Oracle connection: %v", err)
 		}
