@@ -3,51 +3,74 @@ name: Release
 on:
   push:
     tags:
-      - "v*.*.*" # Trigger on version tags (e.g., v1.0.0)
+      - "v*.*.*"
 
 jobs:
-  build-and-release:
+  build-linux:
     runs-on: ubuntu-latest
-    
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
+      - uses: actions/checkout@v3
       - name: Install IBM Data Server Driver
         run: |
-          # Download IBM Data Server Driver for ODBC and CLI (v11.5.9 FP0 as an example)
-          wget -q "https://public.dhe.ibm.com/ibmdl/export/pub/software/data/db2/drivers/odbc_cli/linuxx64_odbc_cli.tar.gz" -O ibm-data-server-driver.tar.gz
-          tar -xzf ibm-data-server-driver.tar.gz -C /tmp
-          # Set environment variables for CGO
-          export C_INCLUDE_PATH=/tmp/clidriver/include:$C_INCLUDE_PATH
-          export LD_LIBRARY_PATH=/tmp/clidriver/lib:$LD_LIBRARY_PATH
-          # Persist these for subsequent steps
-          echo "C_INCLUDE_PATH=$C_INCLUDE_PATH" >> $GITHUB_ENV
-          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> $GITHUB_ENV
-
-      - name: Set up Go
-        uses: actions/setup-go@v4
-        with:
-          go-version: "1.20"
-
+          wget -q "https://public.dhe.ibm.com/ibmdl/export/pub/software/data/db2/drivers/odbc_cli/linuxx64_odbc_cli.tar.gz" -O ibm.tar.gz
+          tar -xzf ibm.tar.gz -C /tmp
+          echo "C_INCLUDE_PATH=/tmp/clidriver/include:$C_INCLUDE_PATH" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=/tmp/clidriver/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
       - name: Install CGO dependencies
-        run: |
-          # Install gcc and libraries required for CGO
-          sudo apt-get update
-          sudo apt-get install -y gcc g++ libc6-dev
-
+        run: sudo apt-get update && sudo apt-get install -y gcc g++ libc6-dev
+      - uses: actions/setup-go@v4
+        with:
+          go-version: "1.24"
       - name: Build for Linux
         run: |
           CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o db-monitoring-app-linux-amd64 cmd/main.go
           sha256sum db-monitoring-app-linux-amd64 > db-monitoring-app-linux-amd64.sha256
+      - uses: actions/upload-artifact@v3
+        with:
+          name: linux-artifacts
+          path: |
+            db-monitoring-app-linux-amd64
+            db-monitoring-app-linux-amd64.sha256
 
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install IBM Data Server Driver (Windows)
+        run: |
+          # Placeholder: Replace with actual Windows driver source or manual upload
+          curl -o ibm-driver.zip "https://your-secure-url/ibm_data_server_driver_winx64.zip" --fail || exit 1
+          Expand-Archive -Path ibm-driver.zip -DestinationPath C:\clidriver
+        env:
+          WINDOWS_DRIVER_URL: ${{ secrets.WINDOWS_DRIVER_URL }}
+      - uses: actions/setup-go@v4
+        with:
+          go-version: "1.24"
       - name: Build for Windows
         run: |
-          # Install mingw-w64 for Windows cross-compilation
-          sudo apt-get install -y mingw-w64
-          CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc go build -o db-monitoring-app-windows-amd64.exe cmd/main.go
-          sha256sum db-monitoring-app-windows-amd64.exe > db-monitoring-app-windows-amd64.exe.sha256
+          $env:CGO_ENABLED = "1"
+          $env:C_INCLUDE_PATH = "C:\clidriver\include;" + $env:C_INCLUDE_PATH
+          $env:LIB = "C:\clidriver\lib;" + $env:LIB
+          go build -o db-monitoring-app-windows-amd64.exe cmd/main.go
+          Get-FileHash -Algorithm SHA256 db-monitoring-app-windows-amd64.exe | Format-List > db-monitoring-app-windows-amd64.exe.sha256
+        shell: pwsh
+      - uses: actions/upload-artifact@v3
+        with:
+          name: windows-artifacts
+          path: |
+            db-monitoring-app-windows-amd64.exe
+            db-monitoring-app-windows-amd64.exe.sha256
 
+  release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v3
+        with:
+          name: linux-artifacts
+      - uses: actions/download-artifact@v3
+        with:
+          name: windows-artifacts
       - name: Create Release
         id: create_release
         uses: actions/create-release@v1
@@ -58,7 +81,6 @@ jobs:
           release_name: Release ${{ github.ref_name }}
           draft: false
           prerelease: false
-
       - name: Upload Linux Binary
         uses: actions/upload-release-asset@v1
         env:
@@ -68,7 +90,6 @@ jobs:
           asset_path: ./db-monitoring-app-linux-amd64
           asset_name: db-monitoring-app-linux-amd64
           asset_content_type: application/octet-stream
-
       - name: Upload Linux Checksum
         uses: actions/upload-release-asset@v1
         env:
@@ -78,7 +99,6 @@ jobs:
           asset_path: ./db-monitoring-app-linux-amd64.sha256
           asset_name: db-monitoring-app-linux-amd64.sha256
           asset_content_type: text/plain
-
       - name: Upload Windows Binary
         uses: actions/upload-release-asset@v1
         env:
@@ -88,7 +108,6 @@ jobs:
           asset_path: ./db-monitoring-app-windows-amd64.exe
           asset_name: db-monitoring-app-windows-amd64.exe
           asset_content_type: application/octet-stream
-
       - name: Upload Windows Checksum
         uses: actions/upload-release-asset@v1
         env:
