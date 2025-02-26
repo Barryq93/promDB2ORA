@@ -1,8 +1,6 @@
 module github.com/barryq93/promDB2ORA
 
-go 1.22.1
-
-toolchain go1.24.0
+go 1.23
 
 require (
 	github.com/fsnotify/fsnotify v1.7.0
