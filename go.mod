@@ -4,7 +4,6 @@ go 1.24
 
 require (
 	github.com/fsnotify/fsnotify v1.7.0
-	github.com/godror/godror v0.44.2
 	github.com/gojek/heimdall/v7 v7.0.3
 	github.com/ibmdb/go_ibm_db v0.5.2 // Consider updating if a newer version exists
 	github.com/juju/ratelimit v1.0.2
@@ -21,8 +20,6 @@ require (
 	github.com/cactus/go-statsd-client/statsd v0.0.0-20200423205355-cb0885a1018c // indirect
 	github.com/cespare/xxhash/v2 v2.2.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
-	github.com/go-logfmt/logfmt v0.6.0 // indirect
-	github.com/godror/knownpb v0.1.2 // indirect
 	github.com/gojek/valkyrie v0.0.0-20180215180059-6aee720afcdf // indirect
 	github.com/ibmruntimes/go-recordio/v2 v2.0.0-20240416213906-ae0ad556db70 // indirect
 	github.com/kr/text v0.2.0 // indirect
@@ -33,7 +30,6 @@ require (
 	github.com/prometheus/procfs v0.12.0 // indirect
 	github.com/rcrowley/go-metrics v0.0.0-20201227073835-cf1acfcdf475 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
-	golang.org/x/exp v0.0.0-20240719175910-8a7402abbf56 // indirect
 	golang.org/x/sys v0.17.0 // indirect
 	google.golang.org/protobuf v1.34.2 // indirect
 )
