@@ -4,7 +4,7 @@ on:
   push:
     tags:
       - "v*.*.*"
-
+      
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
@@ -12,15 +12,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Install DB2 Client Libraries
-        run: sudo apt-get install -y ibm-db2
-
       - name: Install IBM Data Server Driver for Linux
         run: |
           wget -q "https://public.dhe.ibm.com/ibmdl/export/pub/software/data/db2/drivers/odbc_cli/linuxx64_odbc_cli.tar.gz" -O ibm.tar.gz
           tar -xzf ibm.tar.gz -C /tmp
           echo "C_INCLUDE_PATH=/tmp/clidriver/include:$C_INCLUDE_PATH" >> $GITHUB_ENV
           echo "LD_LIBRARY_PATH=/tmp/clidriver/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          rm -f ibm.tar.gz
 
       - name: Install CGO dependencies
         run: |
