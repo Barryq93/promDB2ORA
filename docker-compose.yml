@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  db-monitoring-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: db-monitoring-app
+    ports:
+      - "8080:8080"  # Expose the application port
+    volumes:
+      - ./config.yml:/app/config.yml  # Mount the config file
+      - ./certs:/app/certs  # Mount the certificates directory
+    environment:
+      - IBM_DB_HOME=/path/to/ibm_db  # Set DB2 client library path (if needed)
+      - PATH=$PATH:/path/to/oracle/instantclient  # Add Oracle Instant Client to PATH (if needed)
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"  # Expose Prometheus UI
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml  # Mount Prometheus config
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    restart: unless-stopped
+
+  # Add other services (e.g., DB2, Oracle) if needed
+  # db2:
+  #   image: ibmcom/db2
+  #   container_name: db2
+  #   environment:
+  #     - DB2INST1_PASSWORD=yourpassword
+  #     - LICENSE=accept
+  #   ports:
+  #     - "50000:50000"
+  #   volumes:
+  #     - db2data:/db2data
+  #   restart: unless-stopped
+
+# volumes:
+#   db2data:
